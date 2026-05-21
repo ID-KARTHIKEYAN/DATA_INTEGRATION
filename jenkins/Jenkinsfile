@@ -13,7 +13,7 @@ pipeline {
             choices: [
                 'ALL',
                 'karthik_workspace',
-                'user2_workspace',
+                'MARAN_workspace',
                 'user3_workspace'
             ],
             description: 'Select target workspace'
