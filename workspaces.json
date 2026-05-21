@@ -3,7 +3,7 @@
     {
       "name": "karthik_workspace",
       "owner": "Karthik",
-      "workspace_url": "https://dbc-XXXXXXXX-XXXX.cloud.databricks.com",
+      "workspace_url": "https://dbc-9e0f543c-87b6.cloud.databricks.com",
       "job_id": "237799199428148",
       "credential_id": "DATABRICKS_TOKEN_KARTHIK",
       "catalog": "demo_catalog",
