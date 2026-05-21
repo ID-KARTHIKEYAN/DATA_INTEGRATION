@@ -5,135 +5,240 @@
 // ============================================================
 
 pipeline {
+
     agent any
 
     parameters {
+
         choice(
             name: 'WORKSPACE',
-            choices: ['ALL', 'karthik_workspace', 'user2_workspace', 'user3_workspace'],
-            description: 'Select target Databricks workspace (ALL = run on every active workspace)'
+            choices: [
+                'ALL',
+                'karthik_workspace',
+                'user2_workspace',
+                'user3_workspace'
+            ],
+            description: 'Select target workspace'
         )
+
         string(
             name: 'GROUP_ID',
             defaultValue: '',
-            description: 'Enter GROUP_ID (e.g. WEATHER_L0)'
+            description: 'Enter GROUP_ID'
         )
+
         booleanParam(
             name: 'SYNC_GIT',
             defaultValue: true,
-            description: 'Pull latest code from GitHub into each workspace before running'
+            description: 'Sync latest GitHub code to Databricks Repo'
         )
+
         booleanParam(
             name: 'WAIT_FOR_COMPLETION',
             defaultValue: true,
-            description: 'Wait for Databricks run to complete and report status'
+            description: 'Wait until Databricks run completes'
         )
     }
 
     environment {
-        GITHUB_REPO  = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+
+        GITHUB_REPO   = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
         GITHUB_BRANCH = 'main'
-        POLL_INTERVAL = '15'   // seconds between status checks
-        MAX_WAIT_SECS = '1800' // 30 min max wait per workspace
+
+        POLL_INTERVAL = '15'
+        MAX_WAIT_SECS = '1800'
     }
 
     stages {
 
-        // ----------------------------------------------------------
-        // Stage 1 : Validate inputs
-        // ----------------------------------------------------------
+        // ============================================================
+        // Stage 1 — Validate Parameters
+        // ============================================================
+
         stage('Validate Parameters') {
+
             steps {
+
                 script {
+
                     if (!params.GROUP_ID?.trim()) {
+
                         error "❌ GROUP_ID must not be empty."
+
                     }
-                    echo "✅ GROUP_ID     : ${params.GROUP_ID}"
-                    echo "✅ WORKSPACE    : ${params.WORKSPACE}"
-                    echo "✅ SYNC_GIT     : ${params.SYNC_GIT}"
-                    echo "✅ WAIT_FOR_COMPLETION: ${params.WAIT_FOR_COMPLETION}"
+
+                    echo "=================================================="
+                    echo "GROUP_ID            : ${params.GROUP_ID}"
+                    echo "WORKSPACE           : ${params.WORKSPACE}"
+                    echo "SYNC_GIT            : ${params.SYNC_GIT}"
+                    echo "WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}"
+                    echo "=================================================="
                 }
             }
         }
 
-        // ----------------------------------------------------------
-        // Stage 2 : Checkout this repo (workspaces.json lives here)
-        // ----------------------------------------------------------
+        // ============================================================
+        // Stage 2 — Checkout Repo
+        // ============================================================
+
         stage('Checkout Repo') {
+
             steps {
+
                 checkout([
                     $class: 'GitSCM',
                     branches: [[name: "*/${env.GITHUB_BRANCH}"]],
                     userRemoteConfigs: [[
                         url: env.GITHUB_REPO,
-                        credentialsId: 'GITHUB_CREDENTIALS'   // Jenkins credential ID
+                        credentialsId: 'GITHUB_CREDENTIALS'
                     ]]
                 ])
-                echo "✅ Repo checked out — branch: ${env.GITHUB_BRANCH}"
+
+                echo "✅ GitHub repository checked out successfully"
             }
         }
 
-        // ----------------------------------------------------------
-        // Stage 3 : Load workspace registry
-        // ----------------------------------------------------------
+        // ============================================================
+        // Stage 3 — Load Workspace Registry
+        // ============================================================
+
         stage('Load Workspace Registry') {
+
             steps {
+
                 script {
+
                     def registryText = readFile('workspaces.json')
-                    def registry     = readJSON text: registryText
 
-                    // Filter to active workspaces matching the WORKSPACE param
-                    env.WORKSPACE_PARAM = params.WORKSPACE
-                    def allWs = registry.workspaces.findAll { ws ->
+                    def registry = readJSON text: registryText
+
+                    def selected = registry.workspaces.findAll { ws ->
+
                         ws.is_active &&
-                        (env.WORKSPACE_PARAM == 'ALL' || ws.name == env.WORKSPACE_PARAM)
+                        (
+                            params.WORKSPACE == 'ALL' ||
+                            ws.name == params.WORKSPACE
+                        )
                     }
 
-                    if (allWs.isEmpty()) {
-                        error "❌ No active workspaces found for selection: ${env.WORKSPACE_PARAM}"
+                    if (selected.isEmpty()) {
+
+                        error "❌ No active workspaces found."
+
                     }
 
-                    // Serialize for later stages
-                    env.SELECTED_WORKSPACES = groovy.json.JsonOutput.toJson(allWs)
-                    echo "✅ Workspaces selected: ${allWs.collect { it.name }.join(', ')}"
+                    env.SELECTED_WORKSPACES =
+                        writeJSON(returnText: true, json: selected)
+
+                    echo "✅ Selected Workspaces:"
+                    selected.each {
+                        echo "   - ${it.name}"
+                    }
                 }
             }
         }
 
-        // ----------------------------------------------------------
-        // Stage 4 : [Optional] Sync GitHub → Databricks Git Repos
-        // ----------------------------------------------------------
+        // ============================================================
+        // Stage 4 — Sync Git Repos
+        // ============================================================
+
         stage('Sync Git Repos') {
-            when { expression { return params.SYNC_GIT } }
+
+            when {
+                expression { return params.SYNC_GIT }
+            }
+
             steps {
+
                 script {
-                    def workspaces = readJSON text: env.SELECTED_WORKSPACES
+
+                    def workspaces =
+                        readJSON text: env.SELECTED_WORKSPACES
+
                     workspaces.each { ws ->
-                        echo "🔄 Syncing Git Repo for workspace: ${ws.name} (${ws.owner})"
-                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+
+                        echo "--------------------------------------------------"
+                        echo "🔄 Syncing Repo for: ${ws.name}"
+                        echo "--------------------------------------------------"
+
+                        withCredentials([
+                            string(
+                                credentialsId: ws.credential_id,
+                                variable: 'DB_TOKEN'
+                            )
+                        ]) {
+
+                            // =================================================
+                            // STEP 1 — GET REPO LIST
+                            // =================================================
+
+                            def repoResponse = sh(
+                                returnStdout: true,
+                                script: """
+                                    curl -s \\
+                                    -X GET '${ws.workspace_url}/api/2.0/repos' \\
+                                    -H 'Authorization: Bearer \$DB_TOKEN'
+                                """
+                            ).trim()
+
+                            def repoJson = readJSON text: repoResponse
+
+                            def repo = repoJson.repos.find {
+
+                                it.path == ws.github_repo_path
+
+                            }
+
+                            if (!repo) {
+
+                                echo "⚠️ Repo not found:"
+                                echo "   ${ws.github_repo_path}"
+
+                                echo "ℹ️ Continuing pipeline..."
+
+                                return
+                            }
+
+                            def repoId = repo.id
+
+                            echo "✅ Repo ID Found: ${repoId}"
+
+                            // =================================================
+                            // STEP 2 — PATCH REPO
+                            // =================================================
+
                             def syncResponse = sh(
                                 returnStdout: true,
                                 script: """
                                     curl -s -w "\\n%{http_code}" \\
-                                    -X POST '${ws.workspace_url}/api/2.0/repos/update' \\
-                                    -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                    -X PATCH '${ws.workspace_url}/api/2.0/repos/${repoId}' \\
+                                    -H 'Authorization: Bearer \$DB_TOKEN' \\
                                     -H 'Content-Type: application/json' \\
                                     -d '{
-                                        "path": "${ws.github_repo_path}",
                                         "branch": "${env.GITHUB_BRANCH}"
                                     }'
                                 """
                             ).trim()
 
-                            def lines    = syncResponse.split('\n')
-                            def httpCode = lines[-1]
-                            def body     = lines[0..-2].join('\n')
+                            def lines =
+                                syncResponse.split('\n')
+
+                            def httpCode =
+                                lines[-1]
+
+                            def body =
+                                lines[0..-2].join('\n')
 
                             if (httpCode != '200') {
-                                echo "⚠️  Git sync returned HTTP ${httpCode} for ${ws.name}. Response: ${body}"
-                                echo "ℹ️  This is non-fatal — continuing with existing code."
+
+                                echo "⚠️ Git Sync Failed"
+                                echo "Workspace : ${ws.name}"
+                                echo "HTTP Code : ${httpCode}"
+                                echo "Response  : ${body}"
+
                             } else {
-                                echo "✅ Git sync successful for ${ws.name}"
+
+                                echo "✅ Git Sync Successful"
                             }
                         }
                     }
@@ -141,27 +246,44 @@ pipeline {
             }
         }
 
-        // ----------------------------------------------------------
-        // Stage 5 : Trigger Databricks Jobs (parallel per workspace)
-        // ----------------------------------------------------------
+        // ============================================================
+        // Stage 5 — Trigger Databricks Jobs
+        // ============================================================
+
         stage('Trigger Databricks Jobs') {
+
             steps {
+
                 script {
-                    def workspaces = readJSON text: env.SELECTED_WORKSPACES
+
+                    def workspaces =
+                        readJSON text: env.SELECTED_WORKSPACES
+
                     def parallelMap = [:]
-                    def runIds      = [:]  // workspace name → run_id
+
+                    def runIds = [:]
 
                     workspaces.each { ws ->
-                        parallelMap["${ws.name}"] = {
-                            withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
-                                echo "🚀 Triggering job on ${ws.name} | Job ID: ${ws.job_id} | GROUP_ID: ${params.GROUP_ID}"
+
+                        parallelMap[ws.name] = {
+
+                            withCredentials([
+                                string(
+                                    credentialsId: ws.credential_id,
+                                    variable: 'DB_TOKEN'
+                                )
+                            ]) {
+
+                                echo "🚀 Triggering Job"
+                                echo "Workspace : ${ws.name}"
+                                echo "Job ID    : ${ws.job_id}"
 
                                 def triggerResponse = sh(
                                     returnStdout: true,
                                     script: """
                                         curl -s -w "\\n%{http_code}" \\
                                         -X POST '${ws.workspace_url}/api/2.1/jobs/run-now' \\
-                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                        -H 'Authorization: Bearer \$DB_TOKEN' \\
                                         -H 'Content-Type: application/json' \\
                                         -d '{
                                             "job_id": ${ws.job_id},
@@ -172,122 +294,209 @@ pipeline {
                                     """
                                 ).trim()
 
-                                def lines    = triggerResponse.split('\n')
-                                def httpCode = lines[-1]
-                                def body     = lines[0..-2].join('\n')
+                                def lines =
+                                    triggerResponse.split('\n')
+
+                                def httpCode =
+                                    lines[-1]
+
+                                def body =
+                                    lines[0..-2].join('\n')
 
                                 if (httpCode != '200') {
-                                    error "❌ Failed to trigger job on ${ws.name}. HTTP ${httpCode}: ${body}"
+
+                                    error """
+❌ Failed to trigger job
+
+Workspace : ${ws.name}
+HTTP Code : ${httpCode}
+
+Response:
+${body}
+"""
                                 }
 
-                                def resp  = readJSON text: body
-                                def runId = resp.run_id
-                                echo "✅ Job triggered on ${ws.name} — run_id: ${runId}"
+                                def resp =
+                                    readJSON text: body
+
+                                def runId =
+                                    resp.run_id
+
+                                echo "✅ Run Triggered"
+                                echo "Run ID : ${runId}"
+
                                 runIds[ws.name] = [
                                     run_id       : runId,
                                     workspace_url: ws.workspace_url,
-                                    credential_id: ws.credential_id,
-                                    owner        : ws.owner
+                                    credential_id: ws.credential_id
                                 ]
                             }
                         }
                     }
 
                     parallel parallelMap
-                    env.RUN_IDS = groovy.json.JsonOutput.toJson(runIds)
+
+                    env.RUN_IDS =
+                        writeJSON(returnText: true, json: runIds)
                 }
             }
         }
 
-        // ----------------------------------------------------------
-        // Stage 6 : [Optional] Poll until runs complete
-        // ----------------------------------------------------------
-        stage('Wait for Completion') {
-            when { expression { return params.WAIT_FOR_COMPLETION } }
+        // ============================================================
+        // Stage 6 — Wait For Completion
+        // ============================================================
+
+        stage('Wait For Completion') {
+
+            when {
+                expression {
+                    return params.WAIT_FOR_COMPLETION
+                }
+            }
+
             steps {
+
                 script {
-                    def runIds     = readJSON text: env.RUN_IDS
-                    def allPassed  = true
+
+                    def runIds =
+                        readJSON text: env.RUN_IDS
+
+                    def allPassed = true
+
                     def failedList = []
 
                     runIds.each { wsName, info ->
-                        echo "⏳ Polling ${wsName} | run_id: ${info.run_id}"
-                        withCredentials([string(credentialsId: info.credential_id, variable: 'DB_TOKEN')]) {
-                            def elapsed = 0
-                            def done    = false
-                            def lifeCycle = ''
-                            def resultState = ''
 
-                            while (!done && elapsed < Integer.parseInt(env.MAX_WAIT_SECS)) {
-                                sleep(Integer.parseInt(env.POLL_INTERVAL))
-                                elapsed += Integer.parseInt(env.POLL_INTERVAL)
+                        echo "⏳ Polling Run Status: ${wsName}"
+
+                        withCredentials([
+                            string(
+                                credentialsId: info.credential_id,
+                                variable: 'DB_TOKEN'
+                            )
+                        ]) {
+
+                            def elapsed = 0
+                            def done = false
+
+                            def resultState = ''
+                            def lifeCycle = ''
+
+                            while (
+                                !done &&
+                                elapsed < Integer.parseInt(env.MAX_WAIT_SECS)
+                            ) {
+
+                                sleep(
+                                    Integer.parseInt(env.POLL_INTERVAL)
+                                )
+
+                                elapsed +=
+                                    Integer.parseInt(env.POLL_INTERVAL)
 
                                 def statusResponse = sh(
                                     returnStdout: true,
                                     script: """
                                         curl -s \\
                                         -X GET '${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}' \\
-                                        -H 'Authorization: Bearer ${DB_TOKEN}'
+                                        -H 'Authorization: Bearer \$DB_TOKEN'
                                     """
                                 ).trim()
 
-                                def statusJson = readJSON text: statusResponse
-                                lifeCycle  = statusJson.state?.life_cycle_state ?: 'UNKNOWN'
-                                resultState = statusJson.state?.result_state ?: ''
+                                def statusJson =
+                                    readJSON text: statusResponse
 
-                                echo "   ${wsName} → life_cycle: ${lifeCycle}, result: ${resultState}"
+                                lifeCycle =
+                                    statusJson.state?.life_cycle_state ?: 'UNKNOWN'
 
-                                if (['TERMINATED', 'SKIPPED', 'INTERNAL_ERROR'].contains(lifeCycle)) {
+                                resultState =
+                                    statusJson.state?.result_state ?: ''
+
+                                echo """
+Workspace : ${wsName}
+Lifecycle : ${lifeCycle}
+Result    : ${resultState}
+"""
+
+                                if (
+                                    [
+                                        'TERMINATED',
+                                        'SKIPPED',
+                                        'INTERNAL_ERROR'
+                                    ].contains(lifeCycle)
+                                ) {
+
                                     done = true
                                 }
                             }
 
                             if (!done) {
-                                echo "⚠️  ${wsName} timed out after ${env.MAX_WAIT_SECS}s — still running"
+
+                                echo "⚠️ Timeout : ${wsName}"
+
                                 failedList << "${wsName} (TIMEOUT)"
+
                                 allPassed = false
+
                             } else if (resultState != 'SUCCESS') {
-                                echo "❌ ${wsName} finished with result: ${resultState}"
-                                failedList << "${wsName} (${resultState})"
+
+                                echo "❌ Failed : ${wsName}"
+
+                                failedList <<
+                                    "${wsName} (${resultState})"
+
                                 allPassed = false
+
                             } else {
-                                echo "✅ ${wsName} completed successfully!"
+
+                                echo "✅ Success : ${wsName}"
                             }
                         }
                     }
 
                     if (!allPassed) {
-                        error "❌ Some workspaces FAILED or timed out: ${failedList.join(', ')}"
+
+                        error """
+❌ Some workspaces failed
+
+${failedList.join('\n')}
+"""
                     }
+
                     echo "🎉 All workspaces completed successfully!"
                 }
             }
         }
     }
 
-    // ----------------------------------------------------------
-    // Post — Always summarise
-    // ----------------------------------------------------------
+    // ============================================================
+    // POST
+    // ============================================================
+
     post {
+
         always {
-            script {
-                echo """
+
+            echo """
 ╔══════════════════════════════════════════════╗
-║           PIPELINE SUMMARY                  ║
+║              PIPELINE SUMMARY               ║
 ╠══════════════════════════════════════════════╣
 ║ GROUP_ID  : ${params.GROUP_ID}
 ║ WORKSPACE : ${params.WORKSPACE}
 ║ SYNC_GIT  : ${params.SYNC_GIT}
 ║ STATUS    : ${currentBuild.currentResult}
 ╚══════════════════════════════════════════════╝
-                """
-            }
+"""
         }
+
         success {
-            echo "✅ Pipeline SUCCESS — all workspaces processed for GROUP_ID: ${params.GROUP_ID}"
+
+            echo "✅ PIPELINE SUCCESS"
         }
+
         failure {
-            echo "❌ Pipeline FAILED — check individual workspace logs above"
+
+            echo "❌ PIPELINE FAILED"
         }
     }
 }
