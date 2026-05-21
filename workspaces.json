@@ -1,0 +1,38 @@
+{
+  "workspaces": [
+    {
+      "name": "karthik_workspace",
+      "owner": "Karthik",
+      "workspace_url": "https://dbc-XXXXXXXX-XXXX.cloud.databricks.com",
+      "job_id": "237799199428148",
+      "credential_id": "DATABRICKS_TOKEN_KARTHIK",
+      "catalog": "demo_catalog",
+      "github_repo_path": "/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION",
+      "is_active": true
+    },
+    {
+      "name": "user2_workspace",
+      "owner": "User2",
+      "workspace_url": "https://dbc-YYYYYYYY-YYYY.cloud.databricks.com",
+      "job_id": "000000000000001",
+      "credential_id": "DATABRICKS_TOKEN_USER2",
+      "catalog": "demo_catalog",
+      "github_repo_path": "/Workspace/Repos/user2@gmail.com/DATA_INTEGRATION",
+      "is_active": true
+    },
+    {
+      "name": "user3_workspace",
+      "owner": "User3",
+      "workspace_url": "https://dbc-ZZZZZZZZ-ZZZZ.cloud.databricks.com",
+      "job_id": "000000000000002",
+      "credential_id": "DATABRICKS_TOKEN_USER3",
+      "catalog": "demo_catalog",
+      "github_repo_path": "/Workspace/Repos/user3@gmail.com/DATA_INTEGRATION",
+      "is_active": true
+    }
+  ],
+  "github": {
+    "repo_url": "https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git",
+    "branch": "main"
+  }
+}
