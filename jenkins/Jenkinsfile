@@ -332,7 +332,8 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
                                     error "❌ Trigger failed on ${ws.name}\nHTTP ${httpCode}\n${body}"
                                 }
 
-                                def runId = (readJSON text: body).run_id
+                                def trigJson = readJSON text: body
+                                def runId    = trigJson.run_id
                                 echo "✅ Triggered — run_id: ${runId}"
 
                                 runIds[ws.name] = [
