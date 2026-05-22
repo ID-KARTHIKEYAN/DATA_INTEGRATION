@@ -294,11 +294,10 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
 
                                 // ── FIX 1: No TOKEN or WORKSPACE_URL in params ──
                                 // ── FIX 2: new_cluster instead of serverless  ──
-                                def submitPayload = /{"run_name":"job_creation_automation_/ +
-                                    params.GROUP_ID + /","tasks":[{"task_key":"create_jobs_task","notebook_task":{"notebook_path":"/ +
-                                    notebookFullPath + /","base_parameters":{"GROUP_ID":"/ +
-                                    params.GROUP_ID + /"},"source":"WORKSPACE"},"new_cluster":{"spark_version":"15.4.x-scala2.12","node_type_id":"i3.xlarge","num_workers":1}}]}/
-
+                               def submitPayload = /{"run_name":"job_creation_automation_/ +
+                                        params.GROUP_ID + /","tasks":[{"task_key":"create_jobs_task","notebook_task":{"notebook_path":"/ +
+                                        notebookFullPath + /","base_parameters":{"GROUP_ID":"/ +
+                                        params.GROUP_ID + /"},"source":"WORKSPACE"},"environment_key":"default_env"}],"environments":[{"environment_key":"default_env","spec":{"client":"1"}}]}/
                                 def submitResponse = sh(
                                     returnStdout: true,
                                     script: """
