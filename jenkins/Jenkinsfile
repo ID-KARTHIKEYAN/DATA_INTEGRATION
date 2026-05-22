@@ -162,7 +162,8 @@ pipeline {
 
         // ========================================================
         // STAGE 4.5 — CREATE JOB IF NOT EXISTS
-        // Pure REST from Jenkins — no notebook, no serverless
+        // No environment_key or environments block —
+        // free edition assigns compute automatically
         // ========================================================
 
         stage('Create / Verify Jobs') {
@@ -199,6 +200,8 @@ pipeline {
 
                                     def notebookPath = "${ws.github_repo_path}/notebooks/run_framework"
 
+                                    // NO environment_key or environments block —
+                                    // free edition picks compute automatically
                                     def createRaw = sh(
                                         returnStdout: true,
                                         script: """
@@ -216,12 +219,7 @@ pipeline {
                                                   "notebook_path": "${notebookPath}",
                                                   "base_parameters": {"GROUP_ID":"${params.GROUP_ID}"},
                                                   "source": "WORKSPACE"
-                                                },
-                                                "environment_key": "default_env"
-                                              }],
-                                              "environments": [{
-                                                "environment_key": "default_env",
-                                                "spec": {"client":"1"}
+                                                }
                                               }]
                                             }'
                                         """
