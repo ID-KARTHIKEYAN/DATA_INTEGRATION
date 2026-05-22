@@ -248,16 +248,15 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
             }
         }
 
-        // ========================================================
-        // STAGE 4.5 — CREATE / VERIFY JOBS   ← NEW STAGE
-        //
-        // Runs job_creation_automation notebook in each workspace
-        // via the runs/submit API (no pre-existing job needed).
-        // Waits for it to finish before moving to Stage 5.
-        // On success, reads back the job_id from the Jobs list API
-        // and updates SELECTED_WORKSPACES so Stage 5 always has a
-        // valid job_id even for brand-new pipeline groups.
-        // ========================================================
+       // ============================================================
+// REPLACE ONLY the Stage 4.5 block in your Jenkinsfile
+// with the block below.
+// Two things changed:
+//   1. TOKEN and WORKSPACE_URL removed from base_parameters
+//      (notebook reads them from context automatically now)
+//   2. environment_key replaced with new_cluster config
+//      (serverless was causing INTERNAL_ERROR)
+// ============================================================
 
         stage('Create / Verify Jobs') {
 
@@ -273,7 +272,6 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
                     def workspaces =
                         readJSON text: env.SELECTED_WORKSPACES
 
-                    // ── Run notebook in parallel across workspaces ──
                     def parallelMap = [:]
 
                     workspaces.each { ws ->
@@ -291,44 +289,23 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
                                 echo "🛠️  Create/Verify Jobs : ${ws.name}"
                                 echo "=================================================="
 
-                                // Full path to the notebook inside the repo
                                 def notebookFullPath =
-                                    "${ws.github_repo_path}/notebooks/${env.JOB_CREATION_NOTEBOOK}"
+                                    "${ws.github_repo_path}/notebooks/job_creation_automation"
 
-                                // ── Submit one-time notebook run ──────────────
-                                def submitPayload = """
-{
-  "run_name": "job_creation_automation_${params.GROUP_ID}",
-  "tasks": [
-    {
-      "task_key": "create_jobs_task",
-      "notebook_task": {
-        "notebook_path": "${notebookFullPath}",
-        "base_parameters": {
-          "WORKSPACE_URL": "${ws.workspace_url}",
-          "TOKEN":         "$DB_TOKEN",
-          "GROUP_ID":      "${params.GROUP_ID}"
-        },
-        "source": "WORKSPACE"
-      },
-      "environment_key": "default_env"
-    }
-  ],
-  "environments": [
-    {
-      "environment_key": "default_env",
-      "spec": { "environment_version": "3" }
-    }
-  ]
-}
-"""
+                                // ── FIX 1: No TOKEN or WORKSPACE_URL in params ──
+                                // ── FIX 2: new_cluster instead of serverless  ──
+                                def submitPayload = /{"run_name":"job_creation_automation_/ +
+                                    params.GROUP_ID + /","tasks":[{"task_key":"create_jobs_task","notebook_task":{"notebook_path":"/ +
+                                    notebookFullPath + /","base_parameters":{"GROUP_ID":"/ +
+                                    params.GROUP_ID + /"},"source":"WORKSPACE"},"new_cluster":{"spark_version":"15.4.x-scala2.12","node_type_id":"i3.xlarge","num_workers":1}}]}/
+
                                 def submitResponse = sh(
                                     returnStdout: true,
                                     script: """
-                                        curl -s -w "\\n%{http_code}" \
-                                        -X POST "${ws.workspace_url}/api/2.1/jobs/runs/submit" \
-                                        -H "Authorization: Bearer $DB_TOKEN" \
-                                        -H "Content-Type: application/json" \
+                                        curl -s -w "\\n%{http_code}" \\
+                                        -X POST '${ws.workspace_url}/api/2.1/jobs/runs/submit' \\
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                        -H 'Content-Type: application/json' \\
                                         -d '${submitPayload}'
                                     """
                                 ).trim()
@@ -341,31 +318,30 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
                                     error "❌ runs/submit failed on ${ws.name}\nHTTP ${submitHttpCode}\n${submitBody}"
                                 }
 
-                                def submitJson  = readJSON text: submitBody
-                                def autoRunId   = submitJson.run_id
+                                def submitJson = readJSON text: submitBody
+                                def autoRunId  = submitJson.run_id
 
                                 echo "✅ Automation run submitted — run_id: ${autoRunId}"
 
-                                // ── Poll until notebook completes ─────────────
-                                def elapsed    = 0
-                                def done       = false
-                                def lcState    = ''
-                                def rsState    = ''
+                                // ── Poll until notebook finishes ──────────────
+                                def elapsed = 0
+                                def done    = false
+                                def lcState = ''
+                                def rsState = ''
 
                                 while (
                                     !done &&
                                     elapsed < Integer.parseInt(env.MAX_WAIT_SECS)
                                 ) {
-
                                     sleep(Integer.parseInt(env.POLL_INTERVAL))
                                     elapsed += Integer.parseInt(env.POLL_INTERVAL)
 
                                     def pollResp = sh(
                                         returnStdout: true,
                                         script: """
-                                            curl -s \
-                                            -X GET "${ws.workspace_url}/api/2.1/jobs/runs/get?run_id=${autoRunId}" \
-                                            -H "Authorization: Bearer $DB_TOKEN"
+                                            curl -s \\
+                                            -X GET '${ws.workspace_url}/api/2.1/jobs/runs/get?run_id=${autoRunId}' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}'
                                         """
                                     ).trim()
 
@@ -390,14 +366,13 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
 
                                 echo "✅ Jobs created/verified on ${ws.name}"
 
-                                // ── Read back job_id so Stage 5 has it ───────
-                                // Fetch the jobs list and find by GROUP_ID name
+                                // ── Read back job_id ──────────────────────────
                                 def jobsResp = sh(
                                     returnStdout: true,
                                     script: """
-                                        curl -s \
-                                        -X GET "${ws.workspace_url}/api/2.1/jobs/list?limit=100" \
-                                        -H "Authorization: Bearer $DB_TOKEN"
+                                        curl -s \\
+                                        -X GET '${ws.workspace_url}/api/2.1/jobs/list?limit=100' \\
+                                        -H 'Authorization: Bearer ${DB_TOKEN}'
                                     """
                                 ).trim()
 
@@ -407,12 +382,10 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
                                 }
 
                                 if (matchedJob) {
-                                    def resolvedJobId = matchedJob.job_id
-                                    echo "✅ Resolved job_id for ${params.GROUP_ID} : ${resolvedJobId}"
-                                    // Store on ws object so Stage 5 picks it up
-                                    ws.job_id = resolvedJobId
+                                    ws.job_id = matchedJob.job_id
+                                    echo "✅ Resolved job_id: ${ws.job_id}"
                                 } else {
-                                    echo "⚠️ Could not resolve job_id for ${params.GROUP_ID} — will use value from workspaces.json"
+                                    echo "⚠️ Using job_id from workspaces.json"
                                 }
                             }
                         }
@@ -420,13 +393,11 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
 
                     parallel parallelMap
 
-                    // Save updated workspace list (with resolved job_ids) for Stage 5
                     env.SELECTED_WORKSPACES =
                         writeJSON(returnText: true, json: workspaces)
                 }
             }
         }
-
         // ========================================================
         // STAGE 5 — TRIGGER DATABRICKS JOBS
         // ========================================================
