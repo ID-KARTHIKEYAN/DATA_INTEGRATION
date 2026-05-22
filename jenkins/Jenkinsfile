@@ -1,10 +1,7 @@
 // ============================================================
 // Jenkinsfile — Multi-Workspace Databricks Pipeline
-// CHANGE LOG:
-//   + Stage 4.5 "Create / Verify Jobs" — runs job_creation_automation
-//     notebook via Databricks runs/submit API before triggering ETL.
-//     Polls until notebook finishes, then reads the created job_id
-//     back so Stage 5 always has a valid job_id even for new groups.
+// FIX: Stage 4.5 now creates jobs directly via REST API
+//      from Jenkins — no notebook run needed at all.
 // ============================================================
 
 pipeline {
@@ -36,11 +33,10 @@ pipeline {
             description: 'Sync GitHub repo before execution'
         )
 
-        // NEW — lets you skip job creation if jobs already exist
         booleanParam(
             name: 'CREATE_JOBS',
             defaultValue: true,
-            description: 'Run job_creation_automation notebook before ETL'
+            description: 'Auto-create job if it does not exist'
         )
 
         booleanParam(
@@ -51,35 +47,24 @@ pipeline {
     }
 
     environment {
-
         GITHUB_REPO   = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
         GITHUB_BRANCH = 'main'
-
         POLL_INTERVAL = '15'
         MAX_WAIT_SECS = '1800'
-
-        // Path to job_creation_automation inside each workspace repo
-        JOB_CREATION_NOTEBOOK = 'job_creation_automation'
     }
 
     stages {
 
         // ========================================================
-        // STAGE 1 — VALIDATE INPUTS
+        // STAGE 1 — VALIDATE
         // ========================================================
 
         stage('Validate Parameters') {
-
             steps {
-
                 script {
-
                     if (!params.GROUP_ID?.trim()) {
-
                         error "❌ GROUP_ID must not be empty"
-
                     }
-
                     echo """
 ==================================================
 GROUP_ID            : ${params.GROUP_ID}
@@ -98,21 +83,12 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
         // ========================================================
 
         stage('Checkout Repo') {
-
             steps {
-
                 checkout([
                     $class: 'GitSCM',
-
-                    branches: [[
-                        name: "*/${env.GITHUB_BRANCH}"
-                    ]],
-
-                    userRemoteConfigs: [[
-                        url: env.GITHUB_REPO
-                    ]]
+                    branches: [[name: "*/${env.GITHUB_BRANCH}"]],
+                    userRemoteConfigs: [[url: env.GITHUB_REPO]]
                 ])
-
                 echo "✅ Repository checked out successfully"
             }
         }
@@ -122,45 +98,23 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
         // ========================================================
 
         stage('Load Workspace Registry') {
-
             steps {
-
                 script {
+                    def registry = readJSON text: readFile('workspaces.json')
 
-                    def registryText =
-                        readFile('workspaces.json')
-
-                    def registry =
-                        readJSON text: registryText
-
-                    def selected =
-                        registry.workspaces.findAll { ws ->
-
-                            ws.is_active &&
-                            (
-                                params.WORKSPACE == 'ALL' ||
-                                ws.name == params.WORKSPACE
-                            )
-                        }
+                    def selected = registry.workspaces.findAll { ws ->
+                        ws.is_active &&
+                        (params.WORKSPACE == 'ALL' || ws.name == params.WORKSPACE)
+                    }
 
                     if (selected.isEmpty()) {
-
-                        error "❌ No active workspaces found"
-
+                        error "❌ No active workspaces found for: ${params.WORKSPACE}"
                     }
 
-                    env.SELECTED_WORKSPACES =
-                        writeJSON(
-                            returnText: true,
-                            json: selected
-                        )
+                    env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: selected)
 
-                    echo "✅ Selected Workspaces"
-
-                    selected.each {
-
-                        echo "   - ${it.name}"
-                    }
+                    echo "✅ Selected workspaces:"
+                    selected.each { echo "   - ${it.name}" }
                 }
             }
         }
@@ -170,77 +124,54 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
         // ========================================================
 
         stage('Sync Git Repos') {
-
-            when {
-
-                expression { return params.SYNC_GIT }
-            }
-
+            when { expression { return params.SYNC_GIT } }
             steps {
-
                 script {
-
-                    def workspaces =
-                        readJSON text: env.SELECTED_WORKSPACES
+                    def workspaces = readJSON text: env.SELECTED_WORKSPACES
 
                     workspaces.each { ws ->
 
-                        echo "=================================================="
-                        echo "🔄 Syncing Repo : ${ws.name}"
-                        echo "=================================================="
+                        echo "🔄 Syncing : ${ws.name}"
 
-                        withCredentials([
-                            string(
-                                credentialsId: ws.credential_id,
-                                variable: 'DB_TOKEN'
-                            )
-                        ]) {
+                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
 
-                            def repoResponse = sh(
+                            // Get repo list
+                            def repoResp = sh(
                                 returnStdout: true,
                                 script: """
                                     curl -s \
-                                    -X GET "${ws.workspace_url}/api/2.0/repos" \
-                                    -H "Authorization: Bearer $DB_TOKEN"
+                                    -X GET '${ws.workspace_url}/api/2.0/repos' \
+                                    -H 'Authorization: Bearer ${DB_TOKEN}'
                                 """
                             ).trim()
 
-                            def repoJson =
-                                readJSON text: repoResponse
-
-                            def repo =
-                                repoJson.repos.find {
-                                    it.path == ws.github_repo_path
-                                }
+                            def repos = readJSON text: repoResp
+                            def repo  = repos.repos?.find { it.path == ws.github_repo_path }
 
                             if (!repo) {
-                                echo "⚠️ Repo not found at: ${ws.github_repo_path}"
+                                echo "⚠️  Repo not found at: ${ws.github_repo_path} — skipping sync"
                                 return
                             }
 
-                            def repoId = repo.id
-                            echo "✅ Repo ID : ${repoId}"
-
-                            def syncResponse = sh(
+                            // Pull latest
+                            def patchResp = sh(
                                 returnStdout: true,
                                 script: """
                                     curl -s -w "\\n%{http_code}" \
-                                    -X PATCH "${ws.workspace_url}/api/2.0/repos/${repoId}" \
-                                    -H "Authorization: Bearer $DB_TOKEN" \
-                                    -H "Content-Type: application/json" \
-                                    -d '{"branch": "${env.GITHUB_BRANCH}"}'
+                                    -X PATCH '${ws.workspace_url}/api/2.0/repos/${repo.id}' \
+                                    -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                    -H 'Content-Type: application/json' \
+                                    -d '{"branch":"${env.GITHUB_BRANCH}"}'
                                 """
                             ).trim()
 
-                            def lines    = syncResponse.split('\n')
-                            def httpCode = lines[-1]
-                            def body     = lines[0..-2].join('\n')
+                            def patchLines = patchResp.split('\n')
+                            def httpCode   = patchLines[-1]
 
-                            if (httpCode != '200') {
-                                echo "⚠️ Git Sync returned HTTP ${httpCode} for ${ws.name}"
-                                echo "Response : ${body}"
+                            if (httpCode == '200') {
+                                echo "✅ Git sync done : ${ws.name}"
                             } else {
-                                echo "✅ Git Sync Successful"
+                                echo "⚠️  Git sync HTTP ${httpCode} on ${ws.name} — continuing"
                             }
                         }
                     }
@@ -248,143 +179,103 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
             }
         }
 
-       // ============================================================
-// REPLACE ONLY the Stage 4.5 block in your Jenkinsfile
-// with the block below.
-// Two things changed:
-//   1. TOKEN and WORKSPACE_URL removed from base_parameters
-//      (notebook reads them from context automatically now)
-//   2. environment_key replaced with new_cluster config
-//      (serverless was causing INTERNAL_ERROR)
-// ============================================================
+        // ========================================================
+        // STAGE 4.5 — CREATE JOB IF NOT EXISTS
+        // No notebook, no serverless — pure REST API from Jenkins
+        // ========================================================
 
         stage('Create / Verify Jobs') {
-
-            when {
-
-                expression { return params.CREATE_JOBS }
-            }
-
+            when { expression { return params.CREATE_JOBS } }
             steps {
-
                 script {
-
-                    def workspaces =
-                        readJSON text: env.SELECTED_WORKSPACES
-
+                    def workspaces  = readJSON text: env.SELECTED_WORKSPACES
                     def parallelMap = [:]
 
                     workspaces.each { ws ->
 
                         parallelMap[ws.name] = {
 
-                            withCredentials([
-                                string(
-                                    credentialsId: ws.credential_id,
-                                    variable: 'DB_TOKEN'
-                                )
-                            ]) {
+                            withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
 
                                 echo "=================================================="
-                                echo "🛠️  Create/Verify Jobs : ${ws.name}"
+                                echo "🛠️  Create/Verify Job : ${ws.name} | ${params.GROUP_ID}"
                                 echo "=================================================="
 
-                                def notebookFullPath =
-                                    "${ws.github_repo_path}/notebooks/job_creation_automation"
-
-                                // ── FIX 1: No TOKEN or WORKSPACE_URL in params ──
-                                // ── FIX 2: new_cluster instead of serverless  ──
-                               def submitPayload = /{"run_name":"job_creation_automation_/ +
-                                        params.GROUP_ID + /","tasks":[{"task_key":"create_jobs_task","notebook_task":{"notebook_path":"/ +
-                                        notebookFullPath + /","base_parameters":{"GROUP_ID":"/ +
-                                        params.GROUP_ID + /"},"source":"WORKSPACE"},"environment_key":"default_env"}],"environments":[{"environment_key":"default_env","spec":{"client":"1"}}]}/
-                                def submitResponse = sh(
+                                // ── Step 1: List existing jobs ────────────────
+                                def listResp = sh(
                                     returnStdout: true,
                                     script: """
-                                        curl -s -w "\\n%{http_code}" \\
-                                        -X POST '${ws.workspace_url}/api/2.1/jobs/runs/submit' \\
-                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
-                                        -H 'Content-Type: application/json' \\
-                                        -d '${submitPayload}'
-                                    """
-                                ).trim()
-
-                                def submitLines    = submitResponse.split('\n')
-                                def submitHttpCode = submitLines[-1]
-                                def submitBody     = submitLines[0..-2].join('\n')
-
-                                if (submitHttpCode != '200') {
-                                    error "❌ runs/submit failed on ${ws.name}\nHTTP ${submitHttpCode}\n${submitBody}"
-                                }
-
-                                def submitJson = readJSON text: submitBody
-                                def autoRunId  = submitJson.run_id
-
-                                echo "✅ Automation run submitted — run_id: ${autoRunId}"
-
-                                // ── Poll until notebook finishes ──────────────
-                                def elapsed = 0
-                                def done    = false
-                                def lcState = ''
-                                def rsState = ''
-
-                                while (
-                                    !done &&
-                                    elapsed < Integer.parseInt(env.MAX_WAIT_SECS)
-                                ) {
-                                    sleep(Integer.parseInt(env.POLL_INTERVAL))
-                                    elapsed += Integer.parseInt(env.POLL_INTERVAL)
-
-                                    def pollResp = sh(
-                                        returnStdout: true,
-                                        script: """
-                                            curl -s \\
-                                            -X GET '${ws.workspace_url}/api/2.1/jobs/runs/get?run_id=${autoRunId}' \\
-                                            -H 'Authorization: Bearer ${DB_TOKEN}'
-                                        """
-                                    ).trim()
-
-                                    def pollJson = readJSON text: pollResp
-                                    lcState = pollJson.state?.life_cycle_state ?: 'UNKNOWN'
-                                    rsState = pollJson.state?.result_state     ?: ''
-
-                                    echo "   ${ws.name} | lifecycle: ${lcState} | result: ${rsState}"
-
-                                    if (['TERMINATED','SKIPPED','INTERNAL_ERROR'].contains(lcState)) {
-                                        done = true
-                                    }
-                                }
-
-                                if (!done) {
-                                    error "❌ job_creation_automation timed out on ${ws.name}"
-                                }
-
-                                if (rsState != 'SUCCESS') {
-                                    error "❌ job_creation_automation FAILED on ${ws.name} — result: ${rsState}"
-                                }
-
-                                echo "✅ Jobs created/verified on ${ws.name}"
-
-                                // ── Read back job_id ──────────────────────────
-                                def jobsResp = sh(
-                                    returnStdout: true,
-                                    script: """
-                                        curl -s \\
-                                        -X GET '${ws.workspace_url}/api/2.1/jobs/list?limit=100' \\
+                                        curl -s \
+                                        -X GET '${ws.workspace_url}/api/2.1/jobs/list?limit=100' \
                                         -H 'Authorization: Bearer ${DB_TOKEN}'
                                     """
                                 ).trim()
 
-                                def jobsJson   = readJSON text: jobsResp
-                                def matchedJob = jobsJson.jobs?.find { j ->
+                                def listJson   = readJSON text: listResp
+                                def existingJob = listJson.jobs?.find { j ->
                                     j.settings?.name == params.GROUP_ID
                                 }
 
-                                if (matchedJob) {
-                                    ws.job_id = matchedJob.job_id
-                                    echo "✅ Resolved job_id: ${ws.job_id}"
+                                if (existingJob) {
+                                    // Job already exists — use its id
+                                    ws.job_id = existingJob.job_id
+                                    echo "✅ Job already exists — job_id: ${ws.job_id}"
+
                                 } else {
-                                    echo "⚠️ Using job_id from workspaces.json"
+                                    // ── Step 2: Create job via REST API ───────
+                                    echo "📦 Job not found — creating via API..."
+
+                                    // Notebook path = repo path + /notebooks/run_framework
+                                    def notebookPath = "${ws.github_repo_path}/notebooks/run_framework"
+
+                                    def createResp = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \
+                                            -X POST '${ws.workspace_url}/api/2.1/jobs/create' \
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                            -H 'Content-Type: application/json' \
+                                            -d '{
+                                              "name": "${params.GROUP_ID}",
+                                              "max_concurrent_runs": 1,
+                                              "parameters": [
+                                                {"name": "GROUP_ID", "default": "${params.GROUP_ID}"}
+                                              ],
+                                              "tasks": [
+                                                {
+                                                  "task_key": "${params.GROUP_ID}_task",
+                                                  "notebook_task": {
+                                                    "notebook_path": "${notebookPath}",
+                                                    "base_parameters": {
+                                                      "GROUP_ID": "${params.GROUP_ID}"
+                                                    },
+                                                    "source": "WORKSPACE"
+                                                  },
+                                                  "environment_key": "default_env"
+                                                }
+                                              ],
+                                              "environments": [
+                                                {
+                                                  "environment_key": "default_env",
+                                                  "spec": {"client": "1"}
+                                                }
+                                              ]
+                                            }'
+                                        """
+                                    ).trim()
+
+                                    def createLines  = createResp.split('\n')
+                                    def createCode   = createLines[-1]
+                                    def createBody   = createLines[0..-2].join('\n')
+
+                                    if (createCode != '200') {
+                                        error "❌ Job creation failed on ${ws.name}\nHTTP ${createCode}\n${createBody}"
+                                    }
+
+                                    def createJson = readJSON text: createBody
+                                    ws.job_id      = createJson.job_id
+
+                                    echo "✅ Job created — job_id: ${ws.job_id}"
                                 }
                             }
                         }
@@ -392,24 +283,20 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
 
                     parallel parallelMap
 
-                    env.SELECTED_WORKSPACES =
-                        writeJSON(returnText: true, json: workspaces)
+                    // Save updated job_ids for Stage 5
+                    env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: workspaces)
                 }
             }
         }
+
         // ========================================================
         // STAGE 5 — TRIGGER DATABRICKS JOBS
         // ========================================================
 
         stage('Trigger Databricks Jobs') {
-
             steps {
-
                 script {
-
-                    def workspaces =
-                        readJSON text: env.SELECTED_WORKSPACES
-
+                    def workspaces  = readJSON text: env.SELECTED_WORKSPACES
                     def parallelMap = [:]
                     def runIds      = [:]
 
@@ -417,45 +304,36 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
 
                         parallelMap[ws.name] = {
 
-                            withCredentials([
-                                string(
-                                    credentialsId: ws.credential_id,
-                                    variable: 'DB_TOKEN'
-                                )
-                            ]) {
+                            withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
 
-                                echo "🚀 Triggering Job"
-                                echo "Workspace : ${ws.name}"
-                                echo "Job ID    : ${ws.job_id}"
+                                echo "🚀 Triggering | ${ws.name} | job_id: ${ws.job_id}"
 
-                                def triggerResponse = sh(
+                                def trigResp = sh(
                                     returnStdout: true,
                                     script: """
                                         curl -s -w "\\n%{http_code}" \
-                                        -X POST "${ws.workspace_url}/api/2.1/jobs/run-now" \
-                                        -H "Authorization: Bearer $DB_TOKEN" \
-                                        -H "Content-Type: application/json" \
+                                        -X POST '${ws.workspace_url}/api/2.1/jobs/run-now' \
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                        -H 'Content-Type: application/json' \
                                         -d '{
-                                            "job_id": ${ws.job_id},
-                                            "job_parameters": {
-                                                "GROUP_ID": "${params.GROUP_ID}"
-                                            }
+                                          "job_id": ${ws.job_id},
+                                          "job_parameters": {
+                                            "GROUP_ID": "${params.GROUP_ID}"
+                                          }
                                         }'
                                     """
                                 ).trim()
 
-                                def lines    = triggerResponse.split('\n')
+                                def lines    = trigResp.split('\n')
                                 def httpCode = lines[-1]
                                 def body     = lines[0..-2].join('\n')
 
                                 if (httpCode != '200') {
-                                    error "❌ Failed to trigger job on ${ws.name}\nHTTP ${httpCode}\n${body}"
+                                    error "❌ Trigger failed on ${ws.name}\nHTTP ${httpCode}\n${body}"
                                 }
 
-                                def resp  = readJSON text: body
-                                def runId = resp.run_id
-
-                                echo "✅ Job Triggered — Run ID : ${runId}"
+                                def runId = (readJSON text: body).run_id
+                                echo "✅ Triggered — run_id: ${runId}"
 
                                 runIds[ws.name] = [
                                     run_id       : runId,
@@ -467,9 +345,7 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
                     }
 
                     parallel parallelMap
-
-                    env.RUN_IDS =
-                        writeJSON(returnText: true, json: runIds)
+                    env.RUN_IDS = writeJSON(returnText: true, json: runIds)
                 }
             }
         }
@@ -479,82 +355,63 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
         // ========================================================
 
         stage('Wait For Completion') {
-
-            when {
-
-                expression { return params.WAIT_FOR_COMPLETION }
-            }
-
+            when { expression { return params.WAIT_FOR_COMPLETION } }
             steps {
-
                 script {
-
                     def runIds     = readJSON text: env.RUN_IDS
                     def allPassed  = true
                     def failedList = []
 
                     runIds.each { wsName, info ->
 
-                        echo "=================================================="
                         echo "⏳ Polling : ${wsName}"
-                        echo "=================================================="
 
-                        withCredentials([
-                            string(
-                                credentialsId: info.credential_id,
-                                variable: 'DB_TOKEN'
-                            )
-                        ]) {
+                        withCredentials([string(credentialsId: info.credential_id, variable: 'DB_TOKEN')]) {
 
-                            def elapsed     = 0
-                            def done        = false
-                            def resultState = ''
-                            def lifeCycle   = ''
+                            def elapsed = 0
+                            def done    = false
+                            def lcState = ''
+                            def rsState = ''
 
-                            while (
-                                !done &&
-                                elapsed < Integer.parseInt(env.MAX_WAIT_SECS)
-                            ) {
+                            while (!done && elapsed < Integer.parseInt(env.MAX_WAIT_SECS)) {
 
                                 sleep(Integer.parseInt(env.POLL_INTERVAL))
                                 elapsed += Integer.parseInt(env.POLL_INTERVAL)
 
-                                def statusResponse = sh(
+                                def pollResp = sh(
                                     returnStdout: true,
                                     script: """
                                         curl -s \
-                                        -X GET "${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}" \
-                                        -H "Authorization: Bearer $DB_TOKEN"
+                                        -X GET '${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}' \
+                                        -H 'Authorization: Bearer ${DB_TOKEN}'
                                     """
                                 ).trim()
 
-                                def statusJson = readJSON text: statusResponse
-                                lifeCycle      = statusJson.state?.life_cycle_state ?: 'UNKNOWN'
-                                resultState    = statusJson.state?.result_state     ?: ''
+                                def state = (readJSON text: pollResp).state
+                                lcState   = state?.life_cycle_state ?: 'UNKNOWN'
+                                rsState   = state?.result_state     ?: ''
 
-                                echo "Workspace : ${wsName} | Lifecycle : ${lifeCycle} | Result : ${resultState}"
+                                echo "   ${wsName} | ${lcState} | ${rsState}"
 
-                                if (['TERMINATED','SKIPPED','INTERNAL_ERROR'].contains(lifeCycle)) {
+                                if (['TERMINATED','SKIPPED','INTERNAL_ERROR'].contains(lcState)) {
                                     done = true
                                 }
                             }
 
                             if (!done) {
-                                echo "⚠️ Timeout : ${wsName}"
                                 failedList << "${wsName} (TIMEOUT)"
                                 allPassed = false
-                            } else if (resultState != 'SUCCESS') {
-                                echo "❌ Failed : ${wsName}"
-                                failedList << "${wsName} (${resultState})"
+                            } else if (rsState != 'SUCCESS') {
+                                failedList << "${wsName} (${rsState})"
                                 allPassed = false
                             } else {
-                                echo "✅ Success : ${wsName}"
+                                echo "✅ ${wsName} — SUCCESS"
                             }
                         }
                     }
 
                     if (!allPassed) {
-                        error "❌ Some workspaces failed\n${failedList.join('\n')}"
+                        error "❌ Failed: ${failedList.join(', ')}"
                     }
 
                     echo "🎉 All workspaces completed successfully"
@@ -563,29 +420,20 @@ WAIT_FOR_COMPLETION : ${params.WAIT_FOR_COMPLETION}
         }
     }
 
-    // ========================================================
-    // POST ACTIONS
-    // ========================================================
-
     post {
-
         always {
-
             echo """
 ╔══════════════════════════════════════════════╗
 ║              PIPELINE SUMMARY               ║
 ╠══════════════════════════════════════════════╣
 ║ GROUP_ID    : ${params.GROUP_ID}
 ║ WORKSPACE   : ${params.WORKSPACE}
-║ SYNC_GIT    : ${params.SYNC_GIT}
 ║ CREATE_JOBS : ${params.CREATE_JOBS}
 ║ STATUS      : ${currentBuild.currentResult}
 ╚══════════════════════════════════════════════╝
 """
         }
-
         success { echo "✅ PIPELINE SUCCESS" }
-
         failure { echo "❌ PIPELINE FAILED" }
     }
 }
