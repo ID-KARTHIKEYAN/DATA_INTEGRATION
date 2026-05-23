@@ -5,7 +5,7 @@
       "group_id": "DATAKAMIT_TEAM_MEMBER_L0",
       "sources": [
         {
-          "source_url": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/titanic.csv",
+          "source_url": "https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION/blob/main/Meta_data.csv",
           "target_schema": "comp_meta_data",
           "target_table": "team_mem_data",
           "file_format": "csv",
