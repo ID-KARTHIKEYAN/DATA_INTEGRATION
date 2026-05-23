@@ -2,38 +2,14 @@
   "_comment": "Add all your pipeline groups here. Jenkins will deploy these to every workspace automatically.",
   "pipelines": [
     {
-      "group_id": "WEATHER_L0",
+      "group_id": "DATAKAMIT_TEAM_MEMBER_L0",
       "sources": [
         {
-          "source_url"    : "https://raw.githubusercontent.com/Devasree03/ETL_JEN/refs/heads/main/data/weather.csv",
-          "target_schema" : "bronze",
-          "target_table"  : "weather_data",
-          "file_format"   : "csv",
-          "load_type"     : "FULL"
-        }
-      ]
-    },
-    {
-      "group_id": "BANKING_L0_RAW",
-      "sources": [
-        {
-          "source_url"    : "https://your-source-url/banking.csv",
-          "target_schema" : "bronze",
-          "target_table"  : "banking_data",
-          "file_format"   : "csv",
-          "load_type"     : "FULL"
-        }
-      ]
-    },
-    {
-      "group_id": "TITANIC_L0",
-      "sources": [
-        {
-          "source_url"    : "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/titanic.csv",
-          "target_schema" : "bronze",
-          "target_table"  : "titanic_data",
-          "file_format"   : "csv",
-          "load_type"     : "FULL"
+          "source_url": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/titanic.csv",
+          "target_schema": "comp_meta_data",
+          "target_table": "team_mem_data",
+          "file_format": "csv",
+          "load_type": "FULL"
         }
       ]
     }
