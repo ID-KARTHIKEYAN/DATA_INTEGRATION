@@ -1,9 +1,6 @@
 // ============================================================
 // Jenkinsfile_deployment
 // DATABRICKS-FRAMEWORK-DEPLOYMENT-PIPELINE
-// Reads workspaces.json and auto-deploys all control table
-// entries into every workspace via Databricks SQL API.
-// No manual SQL entry needed.
 // ============================================================
 
 pipeline {
@@ -55,17 +52,18 @@ pipeline {
         }
 
         // ========================================================
-        // STAGE 2 — LOAD REGISTRIES
+        // STAGE 2 — LOAD CONFIG FILES
         // ========================================================
 
         stage('Load Config') {
             steps {
                 script {
-                    // Load workspace registry
-                    def wsRaw    = readFile('workspaces.json')
-                    def wsReg    = readJSON text: wsRaw
 
-                    def selected = wsReg.workspaces.findAll { ws ->
+                    // ── Load workspaces.json ──────────────────────
+                    def wsRaw      = readFile('workspaces.json')
+                    def wsRegistry = readJSON text: wsRaw
+
+                    def selected = wsRegistry.workspaces.findAll { ws ->
                         ws.is_active &&
                         (params.WORKSPACE == 'ALL' || ws.name == params.WORKSPACE)
                     }
@@ -76,16 +74,16 @@ pipeline {
 
                     env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: selected)
 
-                    // Load pipeline definitions
-                    def plRaw = readFile('pipelines.json')
-                    env.PIPELINES_JSON = plRaw
+                    // ── Load pipelines.json ───────────────────────
+                    def plRaw       = readFile('pipelines.json')
+                    def plRegistry  = readJSON text: plRaw
+                    env.PIPELINES_JSON = writeJSON(returnText: true, json: plRegistry)
 
                     echo "Workspaces to deploy:"
                     selected.each { echo "  - ${it.name}" }
 
-                    def pipelines = readJSON text: plRaw
-                    echo "\nPipelines to register: ${pipelines.pipelines.size()}"
-                    pipelines.pipelines.each { echo "  - ${it.group_id}" }
+                    echo "Pipelines to register: ${plRegistry.pipelines.size()}"
+                    plRegistry.pipelines.each { echo "  - ${it.group_id}" }
                 }
             }
         }
@@ -97,166 +95,126 @@ pipeline {
         stage('Deploy Framework Tables') {
             steps {
                 script {
-                    def workspaces  = readJSON text: env.SELECTED_WORKSPACES
-                    def pipelines   = readJSON text: env.PIPELINES_JSON
+
+                    def wsRaw       = env.SELECTED_WORKSPACES
+                    def workspaces  = readJSON text: wsRaw
+
+                    def plRaw       = env.PIPELINES_JSON
+                    def plObj       = readJSON text: plRaw
+
                     def parallelMap = [:]
 
                     workspaces.each { ws ->
 
-                        parallelMap[ws.name] = {
+                        // capture for closure
+                        def wsLocal = ws
 
-                            withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+                        parallelMap[wsLocal.name] = {
+
+                            withCredentials([
+                                string(
+                                    credentialsId: wsLocal.credential_id,
+                                    variable: 'DB_TOKEN'
+                                )
+                            ]) {
 
                                 echo "=================================================="
-                                echo "Deploying to : ${ws.name}"
+                                echo "Deploying to : ${wsLocal.name}"
                                 echo "=================================================="
 
-                                def catalog  = ws.catalog ?: 'demo_catalog'
-                                def repoPath = ws.github_repo_path
+                                def catalog  = wsLocal.catalog  ?: 'demo_catalog'
+                                def repoPath = wsLocal.github_repo_path
 
-                                // ── Helper: run SQL via Databricks API ────────
-                                def runSQL = { String sqlText ->
+                                // ── SQL runner ────────────────────────────────
+                                def runSQL = { String rawSQL ->
 
-                                    def safeSQL  = sqlText.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', '')
+                                    def cleanSQL = rawSQL
+                                        .replaceAll(/\s+/, ' ')
+                                        .trim()
+                                        .replace('\\', '\\\\')
+                                        .replace('"', '\\"')
 
-                                    def submitRaw = sh(
+                                    def apiRaw = sh(
                                         returnStdout: true,
                                         script: """
                                             curl -s -w "\\n%{http_code}" \\
-                                            -X POST '${ws.workspace_url}/api/2.0/sql/statements' \\
+                                            -X POST '${wsLocal.workspace_url}/api/2.0/sql/statements' \\
                                             -H 'Authorization: Bearer ${DB_TOKEN}' \\
                                             -H 'Content-Type: application/json' \\
-                                            -d '{"statement":"${safeSQL}","wait_timeout":"${env.SQL_WAIT}","on_wait_timeout":"CANCEL"}'
+                                            -d '{"statement":"${cleanSQL}","wait_timeout":"${env.SQL_WAIT}","on_wait_timeout":"CANCEL"}'
                                         """
                                     ).trim()
 
-                                    def submitLines = submitRaw.split('\n')
-                                    def httpCode    = submitLines[-1]
-                                    def submitBody  = submitLines[0..-2].join('\n')
+                                    def apiLines  = apiRaw.split('\n')
+                                    def httpCode  = apiLines[-1]
+                                    def apiBody   = apiLines[0..-2].join('\n')
 
                                     if (httpCode != '200') {
-                                        error "SQL failed HTTP ${httpCode}: ${submitBody}"
+                                        error "SQL API failed HTTP ${httpCode}: ${apiBody}"
                                     }
 
-                                    def resp   = readJSON text: submitBody
-                                    def status = resp.status?.state ?: 'UNKNOWN'
+                                    def apiJson   = readJSON text: apiBody
+                                    def sqlState  = apiJson.status?.state ?: 'UNKNOWN'
 
-                                    if (status == 'FAILED') {
-                                        def errMsg = resp.status?.error?.message ?: 'Unknown SQL error'
+                                    if (sqlState == 'FAILED') {
+                                        def errMsg = apiJson.status?.error?.message ?: 'Unknown SQL error'
                                         error "SQL FAILED: ${errMsg}"
                                     }
 
-                                    return status
+                                    return sqlState
                                 }
 
-                                // ── STEP 1: Create schema and tables ──────────
+                                // ── STEP 1 : Create tables ────────────────────
                                 if (params.CREATE_TABLES) {
 
-                                    echo "  Creating schema and control tables..."
+                                    echo "  Creating schema and tables..."
 
-                                    def ddlStatements = [
-                                        "CREATE SCHEMA IF NOT EXISTS ${catalog}.admin",
+                                    def schema    = "CREATE SCHEMA IF NOT EXISTS ${catalog}.admin"
+                                    def headerTbl = "CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_control_header ( DATA_FLOW_GROUP_ID STRING NOT NULL, JOB_NAME STRING, NOTEBOOK_PATH STRING, IS_ACTIVE STRING DEFAULT 'Y', CREATED_DATE TIMESTAMP, UPDATED_DATE TIMESTAMP ) USING DELTA"
+                                    def detailTbl = "CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l0_detail ( DATA_FLOW_GROUP_ID STRING NOT NULL, SOURCE_URL STRING, TARGET_SCHEMA STRING, TARGET_TABLE STRING, FILE_FORMAT STRING, LOAD_TYPE STRING DEFAULT 'FULL', IS_ACTIVE STRING DEFAULT 'Y', CREATED_DATE TIMESTAMP, UPDATED_DATE TIMESTAMP ) USING DELTA"
+                                    def auditTbl  = "CREATE TABLE IF NOT EXISTS ${catalog}.admin.audit_log ( DATA_FLOW_GROUP_ID STRING, TARGET_TABLE STRING, STATUS STRING, MESSAGE STRING, LOAD_TS TIMESTAMP ) USING DELTA"
 
-                                        """CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_control_header (
-                                            DATA_FLOW_GROUP_ID STRING NOT NULL,
-                                            JOB_NAME           STRING,
-                                            NOTEBOOK_PATH      STRING,
-                                            IS_ACTIVE          STRING DEFAULT 'Y',
-                                            CREATED_DATE       TIMESTAMP,
-                                            UPDATED_DATE       TIMESTAMP
-                                        ) USING DELTA""",
+                                    runSQL(schema)
+                                    echo "  schema — done"
 
-                                        """CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l0_detail (
-                                            DATA_FLOW_GROUP_ID STRING NOT NULL,
-                                            SOURCE_URL         STRING,
-                                            TARGET_SCHEMA      STRING,
-                                            TARGET_TABLE       STRING,
-                                            FILE_FORMAT        STRING,
-                                            LOAD_TYPE          STRING DEFAULT 'FULL',
-                                            IS_ACTIVE          STRING DEFAULT 'Y',
-                                            CREATED_DATE       TIMESTAMP,
-                                            UPDATED_DATE       TIMESTAMP
-                                        ) USING DELTA""",
+                                    runSQL(headerTbl)
+                                    echo "  data_flow_control_header — done"
 
-                                        """CREATE TABLE IF NOT EXISTS ${catalog}.admin.audit_log (
-                                            DATA_FLOW_GROUP_ID STRING,
-                                            TARGET_TABLE       STRING,
-                                            STATUS             STRING,
-                                            MESSAGE            STRING,
-                                            LOAD_TS            TIMESTAMP
-                                        ) USING DELTA"""
-                                    ]
+                                    runSQL(detailTbl)
+                                    echo "  data_flow_l0_detail — done"
 
-                                    ddlStatements.each { sql ->
-                                        def tblName = sql.contains('SCHEMA') ? 'schema' :
-                                                      sql.contains('control_header') ? 'control_header' :
-                                                      sql.contains('l0_detail') ? 'l0_detail' : 'audit_log'
-                                        def st = runSQL(sql)
-                                        echo "  ✅ ${tblName} — ${st}"
-                                    }
+                                    runSQL(auditTbl)
+                                    echo "  audit_log — done"
                                 }
 
-                                // ── STEP 2: Insert pipeline rows ──────────────
+                                // ── STEP 2 : Insert pipeline rows ─────────────
                                 if (params.INSERT_PIPELINES) {
 
-                                    echo "\n  Inserting pipeline registrations..."
+                                    echo "  Inserting pipeline registrations..."
 
-                                    def pipelineList = (readJSON text: env.PIPELINES_JSON).pipelines
+                                    def pipelineList = plObj.pipelines
 
                                     pipelineList.each { pl ->
 
                                         def groupId      = pl.group_id
                                         def notebookPath = "${repoPath}/notebooks/run_framework"
 
-                                        // Header MERGE
-                                        def headerSQL = """
-                                            MERGE INTO ${catalog}.admin.data_flow_control_header AS tgt
-                                            USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,
-                                                          '${groupId}_JOB' AS JOB_NAME,
-                                                          '${notebookPath}' AS NOTEBOOK_PATH,
-                                                          'Y' AS IS_ACTIVE,
-                                                          current_timestamp() AS CREATED_DATE,
-                                                          current_timestamp() AS UPDATED_DATE) AS src
-                                            ON tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID
-                                            WHEN MATCHED THEN UPDATE SET
-                                                tgt.NOTEBOOK_PATH = src.NOTEBOOK_PATH,
-                                                tgt.IS_ACTIVE     = src.IS_ACTIVE,
-                                                tgt.UPDATED_DATE  = src.UPDATED_DATE
-                                            WHEN NOT MATCHED THEN INSERT *
-                                        """
-                                        runSQL(headerSQL)
-                                        echo "  ✅ Header : ${groupId}"
+                                        def headerSQL = "MERGE INTO ${catalog}.admin.data_flow_control_header AS tgt USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID, '${groupId}_JOB' AS JOB_NAME, '${notebookPath}' AS NOTEBOOK_PATH, 'Y' AS IS_ACTIVE, current_timestamp() AS CREATED_DATE, current_timestamp() AS UPDATED_DATE) AS src ON tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH = src.NOTEBOOK_PATH, tgt.IS_ACTIVE = src.IS_ACTIVE, tgt.UPDATED_DATE = src.UPDATED_DATE WHEN NOT MATCHED THEN INSERT *"
 
-                                        // Detail MERGE — one row per source
+                                        runSQL(headerSQL)
+                                        echo "  Header inserted : ${groupId}"
+
                                         pl.sources.each { src ->
-                                            def detailSQL = """
-                                                MERGE INTO ${catalog}.admin.data_flow_l0_detail AS tgt
-                                                USING (SELECT '${groupId}'       AS DATA_FLOW_GROUP_ID,
-                                                              '${src.source_url}' AS SOURCE_URL,
-                                                              '${src.target_schema}' AS TARGET_SCHEMA,
-                                                              '${src.target_table}'  AS TARGET_TABLE,
-                                                              '${src.file_format}'   AS FILE_FORMAT,
-                                                              '${src.load_type}'     AS LOAD_TYPE,
-                                                              'Y'                    AS IS_ACTIVE,
-                                                              current_timestamp()    AS CREATED_DATE,
-                                                              current_timestamp()    AS UPDATED_DATE) AS src
-                                                ON  tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID
-                                                AND tgt.TARGET_TABLE       = src.TARGET_TABLE
-                                                WHEN MATCHED THEN UPDATE SET
-                                                    tgt.SOURCE_URL   = src.SOURCE_URL,
-                                                    tgt.FILE_FORMAT  = src.FILE_FORMAT,
-                                                    tgt.LOAD_TYPE    = src.LOAD_TYPE,
-                                                    tgt.IS_ACTIVE    = src.IS_ACTIVE,
-                                                    tgt.UPDATED_DATE = src.UPDATED_DATE
-                                                WHEN NOT MATCHED THEN INSERT *
-                                            """
+
+                                            def detailSQL = "MERGE INTO ${catalog}.admin.data_flow_l0_detail AS tgt USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID, '${src.source_url}' AS SOURCE_URL, '${src.target_schema}' AS TARGET_SCHEMA, '${src.target_table}' AS TARGET_TABLE, '${src.file_format}' AS FILE_FORMAT, '${src.load_type}' AS LOAD_TYPE, 'Y' AS IS_ACTIVE, current_timestamp() AS CREATED_DATE, current_timestamp() AS UPDATED_DATE) AS src ON tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE = src.TARGET_TABLE WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL = src.SOURCE_URL, tgt.FILE_FORMAT = src.FILE_FORMAT, tgt.LOAD_TYPE = src.LOAD_TYPE, tgt.IS_ACTIVE = src.IS_ACTIVE, tgt.UPDATED_DATE = src.UPDATED_DATE WHEN NOT MATCHED THEN INSERT *"
+
                                             runSQL(detailSQL)
-                                            echo "  ✅ Detail : ${groupId} → ${src.target_table}"
+                                            echo "  Detail inserted : ${groupId} -> ${src.target_table}"
                                         }
                                     }
                                 }
 
-                                echo "\n✅ Deployment complete : ${ws.name}"
+                                echo "Deployment complete : ${wsLocal.name}"
                             }
                         }
                     }
