@@ -32,7 +32,7 @@ pipeline {
     environment {
         GITHUB_REPO   = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
         GITHUB_BRANCH = 'main'
-        SQL_WAIT      = '60s'
+        SQL_WAIT      = '50s'
     }
 
     stages {
