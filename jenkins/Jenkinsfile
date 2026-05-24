@@ -56,7 +56,7 @@ pipeline {
         GITHUB_REPO_NAME   = 'DATA_INTEGRATION'
         GITHUB_BRANCH      = 'main'
         POLL_INTERVAL      = '15'
-        GITHUB_CREDENTIAL_ID = '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' // ← ADD THIS LINE
+        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET' // ← ADD THIS LINE
         MAX_WAIT_SECS      = '1800'
     }
 
