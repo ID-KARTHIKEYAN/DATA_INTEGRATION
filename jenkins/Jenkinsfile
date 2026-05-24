@@ -1,5 +1,9 @@
 // ============================================================
 // Jenkinsfile — Multi-Workspace Databricks Pipeline
+// NEW STAGE 4 : Sync Control Tables → GitHub
+//   Before running ETL, reads each workspace's control table
+//   entries for the GROUP_ID, merges them into pipelines.json,
+//   and pushes the updated file to GitHub automatically.
 // ============================================================
 
 pipeline {
@@ -27,6 +31,12 @@ pipeline {
         )
 
         booleanParam(
+            name: 'SYNC_TABLES_TO_GITHUB',
+            defaultValue: true,
+            description: 'Read control table entries and push to pipelines.json on GitHub'
+        )
+
+        booleanParam(
             name: 'CREATE_JOBS',
             defaultValue: true,
             description: 'Auto-create job if it does not exist'
@@ -40,10 +50,13 @@ pipeline {
     }
 
     environment {
-        GITHUB_REPO   = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
-        GITHUB_BRANCH = 'main'
-        POLL_INTERVAL = '15'
-        MAX_WAIT_SECS = '1800'
+        GITHUB_REPO        = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+        GITHUB_API         = 'https://api.github.com'
+        GITHUB_OWNER       = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME   = 'DATA_INTEGRATION'
+        GITHUB_BRANCH      = 'main'
+        POLL_INTERVAL      = '15'
+        MAX_WAIT_SECS      = '1800'
     }
 
     stages {
@@ -114,8 +127,7 @@ pipeline {
             when { expression { return params.SYNC_GIT } }
             steps {
                 script {
-                    def rawText    = env.SELECTED_WORKSPACES
-                    def workspaces = readJSON text: rawText
+                    def workspaces = readJSON text: env.SELECTED_WORKSPACES
 
                     workspaces.each { ws ->
                         echo "Syncing : ${ws.name}"
@@ -146,14 +158,8 @@ pipeline {
                                 """
                             ).trim()
 
-                            def patchLines = patchRaw.split('\n')
-                            def patchCode  = patchLines[-1]
-
-                            if (patchCode == '200') {
-                                echo "Git sync OK : ${ws.name}"
-                            } else {
-                                echo "Git sync HTTP ${patchCode} on ${ws.name} — continuing"
-                            }
+                            def patchCode = patchRaw.split('\n')[-1]
+                            echo patchCode == '200' ? "Git sync OK : ${ws.name}" : "Git sync HTTP ${patchCode} — continuing"
                         }
                     }
                 }
@@ -161,17 +167,236 @@ pipeline {
         }
 
         // ========================================================
-        // STAGE 4.5 — CREATE JOB IF NOT EXISTS
-        // No environment_key or environments block —
-        // free edition assigns compute automatically
+        // STAGE 4.5 — SYNC CONTROL TABLES → GITHUB  ← NEW
+        //
+        // For each workspace:
+        //   1. Get warehouse_id
+        //   2. Query data_flow_control_header + l0_detail
+        //      for this GROUP_ID
+        //   3. If rows found, merge into pipelines.json
+        //   4. Push updated pipelines.json to GitHub via API
+        // ========================================================
+
+        stage('Sync Control Tables to GitHub') {
+            when { expression { return params.SYNC_TABLES_TO_GITHUB } }
+            steps {
+                script {
+                    def workspaces = readJSON text: env.SELECTED_WORKSPACES
+
+                    // Load current pipelines.json as base
+                    def plRaw       = readFile('pipelines.json')
+                    def plObj       = readJSON text: plRaw
+                    def allPipelines = plObj.pipelines ?: []
+
+                    // Track whether anything changed
+                    def anyChanges = false
+
+                    workspaces.each { ws ->
+
+                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+
+                            echo "Checking control tables in : ${ws.name}"
+
+                            // ── Get warehouse ─────────────────────────────
+                            def whRaw  = sh(
+                                returnStdout: true,
+                                script: "curl -s -X GET '${ws.workspace_url}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                            ).trim()
+                            def whJson = readJSON text: whRaw
+                            def warehouses = whJson.warehouses ?: []
+
+                            if (warehouses.isEmpty()) {
+                                echo "  No warehouse in ${ws.name} — skipping table sync"
+                                return
+                            }
+
+                            def warehouseId = warehouses[0].id
+                            def catalog     = ws.catalog ?: 'demo_catalog'
+                            def groupId     = params.GROUP_ID
+
+                            // ── Helper: run SQL and return rows ───────────
+                            def querySQL = { String sqlText ->
+                                def payloadMap = [
+                                    statement       : sqlText,
+                                    warehouse_id    : warehouseId,
+                                    wait_timeout    : '50s',
+                                    on_wait_timeout : 'CANCEL'
+                                ]
+                                def payloadJson = writeJSON(returnText: true, json: payloadMap)
+                                def tmpFile     = "/tmp/qry_${ws.name}_${System.currentTimeMillis()}.json"
+                                writeFile file: tmpFile, text: payloadJson
+
+                                def qRaw = sh(
+                                    returnStdout: true,
+                                    script: """
+                                        curl -s -w "\\n%{http_code}" \\
+                                        -X POST '${ws.workspace_url}/api/2.0/sql/statements' \\
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                        -H 'Content-Type: application/json' \\
+                                        -d @${tmpFile}
+                                    """
+                                ).trim()
+
+                                sh "rm -f ${tmpFile}"
+
+                                def qLines  = qRaw.split('\n')
+                                def qCode   = qLines[-1]
+                                def qBody   = qLines[0..-2].join('\n')
+
+                                if (qCode != '200') {
+                                    echo "  Query HTTP ${qCode} — skipping: ${qBody}"
+                                    return []
+                                }
+
+                                def qJson = readJSON text: qBody
+                                if (qJson.status?.state == 'FAILED') {
+                                    echo "  Query FAILED — skipping"
+                                    return []
+                                }
+
+                                return qJson.result?.data_array ?: []
+                            }
+
+                            // ── Query header table ────────────────────────
+                            def headerRows = querySQL(
+                                "SELECT DATA_FLOW_GROUP_ID, NOTEBOOK_PATH FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y'"
+                            )
+
+                            if (headerRows.isEmpty()) {
+                                echo "  No header entry for ${groupId} in ${ws.name} — skipping"
+                                return
+                            }
+
+                            echo "  Found header entry for ${groupId} in ${ws.name}"
+
+                            // ── Query detail table ────────────────────────
+                            def detailRows = querySQL(
+                                "SELECT SOURCE_URL, TARGET_SCHEMA, TARGET_TABLE, FILE_FORMAT, LOAD_TYPE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y'"
+                            )
+
+                            if (detailRows.isEmpty()) {
+                                echo "  No detail entries for ${groupId} in ${ws.name} — skipping"
+                                return
+                            }
+
+                            echo "  Found ${detailRows.size()} detail row(s) for ${groupId}"
+
+                            // ── Build sources list from detail rows ───────
+                            // Columns: SOURCE_URL[0], TARGET_SCHEMA[1], TARGET_TABLE[2], FILE_FORMAT[3], LOAD_TYPE[4]
+                            def sources = detailRows.collect { r ->
+                                [
+                                    source_url    : r[0],
+                                    target_schema : r[1],
+                                    target_table  : r[2],
+                                    file_format   : r[3],
+                                    load_type     : r[4]
+                                ]
+                            }
+
+                            // ── Merge into allPipelines ───────────────────
+                            def existing = allPipelines.find { it.group_id == groupId }
+
+                            if (existing) {
+                                // Update existing entry
+                                existing.sources = sources
+                                echo "  Updated existing entry in pipelines.json: ${groupId}"
+                            } else {
+                                // Add new entry
+                                allPipelines.add([group_id: groupId, sources: sources])
+                                echo "  Added new entry to pipelines.json: ${groupId}"
+                            }
+
+                            anyChanges = true
+                        }
+                    }
+
+                    // ── Push updated pipelines.json to GitHub ─────────────
+                    if (anyChanges) {
+                        echo "Changes detected — pushing updated pipelines.json to GitHub..."
+
+                        def updatedObj = [
+                            _comment  : 'Auto-updated by Jenkins Sync Control Tables stage',
+                            pipelines : allPipelines
+                        ]
+                        def updatedJson = writeJSON(returnText: true, json: updatedObj)
+
+                        // Write locally first
+                        writeFile file: 'pipelines.json', text: updatedJson
+
+                        withCredentials([usernamePassword(
+                            credentialsId: 'GITHUB_CREDENTIALS',
+                            usernameVariable: 'GH_USER',
+                            passwordVariable: 'GH_TOKEN'
+                        )]) {
+                            // Get current file SHA (needed for GitHub API update)
+                            def shaRaw = sh(
+                                returnStdout: true,
+                                script: """
+                                    curl -s \\
+                                    -X GET '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/pipelines.json?ref=${env.GITHUB_BRANCH}' \\
+                                    -H 'Authorization: Bearer ${GH_TOKEN}'
+                                """
+                            ).trim()
+
+                            def shaJson    = readJSON text: shaRaw
+                            def currentSha = shaJson.sha
+
+                            // Base64 encode the content
+                            def b64Content = sh(
+                                returnStdout: true,
+                                script: "echo '${updatedJson.replace("'", "'\\''")}' | base64 -w 0"
+                            ).trim()
+
+                            // Build GitHub API payload via temp file
+                            def ghPayload = [
+                                message : "sync: update pipelines.json from ${params.GROUP_ID} control tables [Jenkins]",
+                                content : b64Content,
+                                sha     : currentSha,
+                                branch  : env.GITHUB_BRANCH
+                            ]
+                            def ghPayloadJson = writeJSON(returnText: true, json: ghPayload)
+                            def ghTmpFile     = "/tmp/gh_push_${System.currentTimeMillis()}.json"
+                            writeFile file: ghTmpFile, text: ghPayloadJson
+
+                            def pushRaw = sh(
+                                returnStdout: true,
+                                script: """
+                                    curl -s -w "\\n%{http_code}" \\
+                                    -X PUT '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/pipelines.json' \\
+                                    -H 'Authorization: Bearer ${GH_TOKEN}' \\
+                                    -H 'Content-Type: application/json' \\
+                                    -d @${ghTmpFile}
+                                """
+                            ).trim()
+
+                            sh "rm -f ${ghTmpFile}"
+
+                            def pushCode = pushRaw.split('\n')[-1]
+
+                            if (pushCode == '200' || pushCode == '201') {
+                                echo "pipelines.json pushed to GitHub successfully"
+                            } else {
+                                def pushBody = pushRaw.split('\n')[0..-2].join('\n')
+                                error "GitHub push failed HTTP ${pushCode}: ${pushBody}"
+                            }
+                        }
+
+                    } else {
+                        echo "No control table entries found — pipelines.json unchanged"
+                    }
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 5 — CREATE / VERIFY JOBS
         // ========================================================
 
         stage('Create / Verify Jobs') {
             when { expression { return params.CREATE_JOBS } }
             steps {
                 script {
-                    def rawText     = env.SELECTED_WORKSPACES
-                    def workspaces  = readJSON text: rawText
+                    def workspaces  = readJSON text: env.SELECTED_WORKSPACES
                     def parallelMap = [:]
 
                     workspaces.each { ws ->
@@ -180,7 +405,6 @@ pipeline {
 
                                 echo "Create/Verify : ${ws.name} | ${params.GROUP_ID}"
 
-                                // ── List existing jobs ────────────────────────
                                 def listRaw  = sh(
                                     returnStdout: true,
                                     script: "curl -s -X GET '${ws.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'"
@@ -194,14 +418,11 @@ pipeline {
                                 if (existingJob) {
                                     ws.job_id = existingJob.job_id
                                     echo "Job exists — job_id: ${ws.job_id}"
-
                                 } else {
                                     echo "Job not found — creating..."
 
                                     def notebookPath = "${ws.github_repo_path}/notebooks/run_framework"
 
-                                    // NO environment_key or environments block —
-                                    // free edition picks compute automatically
                                     def createRaw = sh(
                                         returnStdout: true,
                                         script: """
@@ -235,7 +456,6 @@ pipeline {
 
                                     def createJson = readJSON text: createBody
                                     ws.job_id      = createJson.job_id
-
                                     echo "Job created — job_id: ${ws.job_id}"
                                 }
                             }
@@ -243,21 +463,19 @@ pipeline {
                     }
 
                     parallel parallelMap
-
                     env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: workspaces)
                 }
             }
         }
 
         // ========================================================
-        // STAGE 5 — TRIGGER DATABRICKS JOBS
+        // STAGE 6 — TRIGGER DATABRICKS JOBS
         // ========================================================
 
         stage('Trigger Databricks Jobs') {
             steps {
                 script {
-                    def rawText     = env.SELECTED_WORKSPACES
-                    def workspaces  = readJSON text: rawText
+                    def workspaces  = readJSON text: env.SELECTED_WORKSPACES
                     def parallelMap = [:]
                     def runIds      = [:]
 
@@ -288,7 +506,6 @@ pipeline {
 
                                 def trigJson = readJSON text: trigBody
                                 def runId    = trigJson.run_id
-
                                 echo "Triggered — run_id: ${runId}"
 
                                 runIds[ws.name] = [
@@ -301,22 +518,20 @@ pipeline {
                     }
 
                     parallel parallelMap
-
                     env.RUN_IDS = writeJSON(returnText: true, json: runIds)
                 }
             }
         }
 
         // ========================================================
-        // STAGE 6 — WAIT FOR COMPLETION
+        // STAGE 7 — WAIT FOR COMPLETION
         // ========================================================
 
         stage('Wait For Completion') {
             when { expression { return params.WAIT_FOR_COMPLETION } }
             steps {
                 script {
-                    def rawText    = env.RUN_IDS
-                    def runIds     = readJSON text: rawText
+                    def runIds     = readJSON text: env.RUN_IDS
                     def allPassed  = true
                     def failedList = []
 
@@ -368,7 +583,6 @@ pipeline {
                     if (!allPassed) {
                         error "Failed workspaces: ${failedList.join(', ')}"
                     }
-
                     echo "All workspaces completed successfully"
                 }
             }
