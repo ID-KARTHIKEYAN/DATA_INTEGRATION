@@ -1,9 +1,7 @@
 // ============================================================
 // Jenkinsfile — Multi-Workspace Databricks Pipeline
-// NEW STAGE 4 : Sync Control Tables → GitHub
-//   Before running ETL, reads each workspace's control table
-//   entries for the GROUP_ID, merges them into pipelines.json,
-//   and pushes the updated file to GitHub automatically.
+// Sync stage now writes .sql files to META_STORE_SQL_SCRIPTS/
+// instead of updating pipelines.json
 // ============================================================
 
 pipeline {
@@ -33,7 +31,7 @@ pipeline {
         booleanParam(
             name: 'SYNC_TABLES_TO_GITHUB',
             defaultValue: true,
-            description: 'Read control table entries and push to pipelines.json on GitHub'
+            description: 'Generate .sql file from control tables and push to META_STORE_SQL_SCRIPTS/'
         )
 
         booleanParam(
@@ -50,14 +48,15 @@ pipeline {
     }
 
     environment {
-        GITHUB_REPO        = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
-        GITHUB_API         = 'https://api.github.com'
-        GITHUB_OWNER       = 'ID-KARTHIKEYAN'
-        GITHUB_REPO_NAME   = 'DATA_INTEGRATION'
-        GITHUB_BRANCH      = 'main'
-        POLL_INTERVAL      = '15'
-        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET' // ← ADD THIS LINE
-        MAX_WAIT_SECS      = '1800'
+        GITHUB_REPO          = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+        GITHUB_API           = 'https://api.github.com'
+        GITHUB_OWNER         = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
+        GITHUB_BRANCH        = 'main'
+        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
+        SQL_SCRIPTS_FOLDER   = 'META_STORE_SQL_SCRIPTS'
+        POLL_INTERVAL        = '15'
+        MAX_WAIT_SECS        = '1800'
     }
 
     stages {
@@ -168,14 +167,11 @@ pipeline {
         }
 
         // ========================================================
-        // STAGE 4.5 — SYNC CONTROL TABLES → GITHUB  ← NEW
+        // STAGE 4.5 — GENERATE SQL FILE → PUSH TO GITHUB
         //
-        // For each workspace:
-        //   1. Get warehouse_id
-        //   2. Query data_flow_control_header + l0_detail
-        //      for this GROUP_ID
-        //   3. If rows found, merge into pipelines.json
-        //   4. Push updated pipelines.json to GitHub via API
+        // Reads each workspace's control tables for GROUP_ID,
+        // generates a MERGE .sql file, pushes to:
+        //   META_STORE_SQL_SCRIPTS/{GROUP_ID}.sql
         // ========================================================
 
         stage('Sync Control Tables to GitHub') {
@@ -183,47 +179,43 @@ pipeline {
             steps {
                 script {
                     def workspaces = readJSON text: env.SELECTED_WORKSPACES
-
-                    // Load current pipelines.json as base
-                    def plRaw       = readFile('pipelines.json')
-                    def plObj       = readJSON text: plRaw
-                    def allPipelines = plObj.pipelines ?: []
-
-                    // Track whether anything changed
+                    def groupId    = params.GROUP_ID
+                    def sqlLines   = []
                     def anyChanges = false
 
                     workspaces.each { ws ->
 
                         withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
 
-                            echo "Checking control tables in : ${ws.name}"
+                            echo "Reading control tables : ${ws.name}"
+
+                            def catalog = ws.catalog ?: 'demo_catalog'
 
                             // ── Get warehouse ─────────────────────────────
                             def whRaw  = sh(
                                 returnStdout: true,
                                 script: "curl -s -X GET '${ws.workspace_url}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
                             ).trim()
-                            def whJson = readJSON text: whRaw
+
+                            def whJson     = readJSON text: whRaw
                             def warehouses = whJson.warehouses ?: []
 
                             if (warehouses.isEmpty()) {
-                                echo "  No warehouse in ${ws.name} — skipping table sync"
+                                echo "  No warehouse in ${ws.name} — skipping"
                                 return
                             }
 
                             def warehouseId = warehouses[0].id
-                            def catalog     = ws.catalog ?: 'demo_catalog'
-                            def groupId     = params.GROUP_ID
 
-                            // ── Helper: run SQL and return rows ───────────
+                            // ── SQL query helper ──────────────────────────
                             def querySQL = { String sqlText ->
-                                def payloadMap = [
+                                def payload = [
                                     statement       : sqlText,
                                     warehouse_id    : warehouseId,
                                     wait_timeout    : '50s',
                                     on_wait_timeout : 'CANCEL'
                                 ]
-                                def payloadJson = writeJSON(returnText: true, json: payloadMap)
+                                def payloadJson = writeJSON(returnText: true, json: payload)
                                 def tmpFile     = "/tmp/qry_${ws.name}_${System.currentTimeMillis()}.json"
                                 writeFile file: tmpFile, text: payloadJson
 
@@ -240,12 +232,12 @@ pipeline {
 
                                 sh "rm -f ${tmpFile}"
 
-                                def qLines  = qRaw.split('\n')
-                                def qCode   = qLines[-1]
-                                def qBody   = qLines[0..-2].join('\n')
+                                def qLines = qRaw.split('\n')
+                                def qCode  = qLines[-1]
+                                def qBody  = qLines[0..-2].join('\n')
 
                                 if (qCode != '200') {
-                                    echo "  Query HTTP ${qCode} — skipping: ${qBody}"
+                                    echo "  Query HTTP ${qCode} — skipping"
                                     return []
                                 }
 
@@ -258,105 +250,138 @@ pipeline {
                                 return qJson.result?.data_array ?: []
                             }
 
-                            // ── Query header table ────────────────────────
+                            // ── Query header ──────────────────────────────
                             def headerRows = querySQL(
                                 "SELECT DATA_FLOW_GROUP_ID, NOTEBOOK_PATH FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y'"
                             )
 
                             if (headerRows.isEmpty()) {
-                                echo "  No header entry for ${groupId} in ${ws.name} — skipping"
+                                echo "  No header for ${groupId} in ${ws.name} — skipping"
                                 return
                             }
 
-                            echo "  Found header entry for ${groupId} in ${ws.name}"
+                            def notebookPath = headerRows[0][1]
+                            echo "  Header found : ${groupId}"
 
-                            // ── Query detail table ────────────────────────
+                            // ── Query detail ──────────────────────────────
                             def detailRows = querySQL(
                                 "SELECT SOURCE_URL, TARGET_SCHEMA, TARGET_TABLE, FILE_FORMAT, LOAD_TYPE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y'"
                             )
 
                             if (detailRows.isEmpty()) {
-                                echo "  No detail entries for ${groupId} in ${ws.name} — skipping"
+                                echo "  No detail rows for ${groupId} — skipping"
                                 return
                             }
 
-                            echo "  Found ${detailRows.size()} detail row(s) for ${groupId}"
+                            echo "  Detail rows found : ${detailRows.size()}"
 
-                            // ── Build sources list from detail rows ───────
-                            // Columns: SOURCE_URL[0], TARGET_SCHEMA[1], TARGET_TABLE[2], FILE_FORMAT[3], LOAD_TYPE[4]
-                            def sources = detailRows.collect { r ->
-                                [
-                                    source_url    : r[0],
-                                    target_schema : r[1],
-                                    target_table  : r[2],
-                                    file_format   : r[3],
-                                    load_type     : r[4]
-                                ]
-                            }
+                            // ── Build .sql content ────────────────────────
+                            // Header: one MERGE per workspace
+                            sqlLines.add("-- ==============================================")
+                            sqlLines.add("-- Workspace : ${ws.name}")
+                            sqlLines.add("-- Group     : ${groupId}")
+                            sqlLines.add("-- Generated : ${new Date().format('yyyy-MM-dd HH:mm:ss')}")
+                            sqlLines.add("-- ==============================================")
+                            sqlLines.add("")
+                            sqlLines.add("MERGE INTO ${catalog}.admin.data_flow_control_header AS tgt")
+                            sqlLines.add("USING (")
+                            sqlLines.add("  SELECT")
+                            sqlLines.add("    '${groupId}'           AS DATA_FLOW_GROUP_ID,")
+                            sqlLines.add("    '${groupId}_JOB'       AS JOB_NAME,")
+                            sqlLines.add("    '${notebookPath}'      AS NOTEBOOK_PATH,")
+                            sqlLines.add("    'Y'                    AS IS_ACTIVE,")
+                            sqlLines.add("    current_timestamp()    AS CREATED_DATE,")
+                            sqlLines.add("    current_timestamp()    AS UPDATED_DATE")
+                            sqlLines.add(") AS src")
+                            sqlLines.add("ON tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID")
+                            sqlLines.add("WHEN MATCHED THEN UPDATE SET")
+                            sqlLines.add("    tgt.NOTEBOOK_PATH = src.NOTEBOOK_PATH,")
+                            sqlLines.add("    tgt.IS_ACTIVE     = src.IS_ACTIVE,")
+                            sqlLines.add("    tgt.UPDATED_DATE  = src.UPDATED_DATE")
+                            sqlLines.add("WHEN NOT MATCHED THEN INSERT *;")
+                            sqlLines.add("")
 
-                            // ── Merge into allPipelines ───────────────────
-                            def existing = allPipelines.find { it.group_id == groupId }
-
-                            if (existing) {
-                                // Update existing entry
-                                existing.sources = sources
-                                echo "  Updated existing entry in pipelines.json: ${groupId}"
-                            } else {
-                                // Add new entry
-                                allPipelines.add([group_id: groupId, sources: sources])
-                                echo "  Added new entry to pipelines.json: ${groupId}"
+                            detailRows.each { r ->
+                                sqlLines.add("MERGE INTO ${catalog}.admin.data_flow_l0_detail AS tgt")
+                                sqlLines.add("USING (")
+                                sqlLines.add("  SELECT")
+                                sqlLines.add("    '${groupId}'  AS DATA_FLOW_GROUP_ID,")
+                                sqlLines.add("    '${r[0]}'     AS SOURCE_URL,")
+                                sqlLines.add("    '${r[1]}'     AS TARGET_SCHEMA,")
+                                sqlLines.add("    '${r[2]}'     AS TARGET_TABLE,")
+                                sqlLines.add("    '${r[3]}'     AS FILE_FORMAT,")
+                                sqlLines.add("    '${r[4]}'     AS LOAD_TYPE,")
+                                sqlLines.add("    'Y'           AS IS_ACTIVE,")
+                                sqlLines.add("    current_timestamp() AS CREATED_DATE,")
+                                sqlLines.add("    current_timestamp() AS UPDATED_DATE")
+                                sqlLines.add(") AS src")
+                                sqlLines.add("ON  tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID")
+                                sqlLines.add("AND tgt.TARGET_TABLE       = src.TARGET_TABLE")
+                                sqlLines.add("WHEN MATCHED THEN UPDATE SET")
+                                sqlLines.add("    tgt.SOURCE_URL   = src.SOURCE_URL,")
+                                sqlLines.add("    tgt.FILE_FORMAT  = src.FILE_FORMAT,")
+                                sqlLines.add("    tgt.LOAD_TYPE    = src.LOAD_TYPE,")
+                                sqlLines.add("    tgt.IS_ACTIVE    = src.IS_ACTIVE,")
+                                sqlLines.add("    tgt.UPDATED_DATE = src.UPDATED_DATE")
+                                sqlLines.add("WHEN NOT MATCHED THEN INSERT *;")
+                                sqlLines.add("")
                             }
 
                             anyChanges = true
                         }
                     }
 
-                    // ── Push updated pipelines.json to GitHub ─────────────
+                    // ── Push .sql file to GitHub ──────────────────────────
                     if (anyChanges) {
-                        echo "Changes detected — pushing updated pipelines.json to GitHub..."
 
-                        def updatedObj = [
-                            _comment  : 'Auto-updated by Jenkins Sync Control Tables stage',
-                            pipelines : allPipelines
-                        ]
-                        def updatedJson = writeJSON(returnText: true, json: updatedObj)
+                        def sqlContent  = sqlLines.join('\n')
+                        def sqlFileName = "${env.SQL_SCRIPTS_FOLDER}/${groupId}.sql"
 
-                        // Write locally first
-                        writeFile file: 'pipelines.json', text: updatedJson
-                            
-                        withCredentials([string(
-                        
-                         credentialsId: env.GITHUB_CREDENTIAL_ID,
-                        
-                         variable: 'GH_TOKEN'
-                        
-                         )]) {
-                            // Get current file SHA (needed for GitHub API update)
-                            def shaRaw = sh(
+                        echo "Pushing ${sqlFileName} to GitHub..."
+
+                        withCredentials([string(credentialsId: env.GITHUB_CREDENTIAL_ID, variable: 'GH_TOKEN')]) {
+
+                            // Check if file already exists (need SHA for update)
+                            def checkRaw = sh(
                                 returnStdout: true,
                                 script: """
-                                    curl -s \\
-                                    -X GET '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/pipelines.json?ref=${env.GITHUB_BRANCH}' \\
+                                    curl -s -w "\\n%{http_code}" \\
+                                    -X GET '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/${sqlFileName}?ref=${env.GITHUB_BRANCH}' \\
                                     -H 'Authorization: Bearer ${GH_TOKEN}'
                                 """
                             ).trim()
 
-                            def shaJson    = readJSON text: shaRaw
-                            def currentSha = shaJson.sha
+                            def checkLines = checkRaw.split('\n')
+                            def checkCode  = checkLines[-1]
+                            def checkBody  = checkLines[0..-2].join('\n')
 
-                            // Base64 encode the content
+                            // Write SQL to temp file and base64 encode
+                            def sqlTmpFile = "/tmp/${groupId}_sql_content.txt"
+                            writeFile file: sqlTmpFile, text: sqlContent
+
                             def b64Content = sh(
                                 returnStdout: true,
-                                script: "echo '${updatedJson.replace("'", "'\\''")}' | base64 -w 0"
+                                script: "base64 -w 0 ${sqlTmpFile}"
                             ).trim()
 
-                            // Build GitHub API payload via temp file
+                            sh "rm -f ${sqlTmpFile}"
+
+                            // Build GitHub payload
                             def ghPayload = [
-                                message : "sync: update pipelines.json from ${params.GROUP_ID} control tables [Jenkins]",
+                                message : "sync: ${groupId}.sql generated from control tables [Jenkins]",
                                 content : b64Content,
-                                sha     : currentSha,
                                 branch  : env.GITHUB_BRANCH
                             ]
+
+                            // If file exists, add SHA for update
+                            if (checkCode == '200') {
+                                def checkJson  = readJSON text: checkBody
+                                ghPayload.sha  = checkJson.sha
+                                echo "  File exists — updating"
+                            } else {
+                                echo "  File does not exist — creating"
+                            }
+
                             def ghPayloadJson = writeJSON(returnText: true, json: ghPayload)
                             def ghTmpFile     = "/tmp/gh_push_${System.currentTimeMillis()}.json"
                             writeFile file: ghTmpFile, text: ghPayloadJson
@@ -365,7 +390,7 @@ pipeline {
                                 returnStdout: true,
                                 script: """
                                     curl -s -w "\\n%{http_code}" \\
-                                    -X PUT '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/pipelines.json' \\
+                                    -X PUT '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/${sqlFileName}' \\
                                     -H 'Authorization: Bearer ${GH_TOKEN}' \\
                                     -H 'Content-Type: application/json' \\
                                     -d @${ghTmpFile}
@@ -377,7 +402,7 @@ pipeline {
                             def pushCode = pushRaw.split('\n')[-1]
 
                             if (pushCode == '200' || pushCode == '201') {
-                                echo "pipelines.json pushed to GitHub successfully"
+                                echo "✅ ${sqlFileName} pushed to GitHub successfully"
                             } else {
                                 def pushBody = pushRaw.split('\n')[0..-2].join('\n')
                                 error "GitHub push failed HTTP ${pushCode}: ${pushBody}"
@@ -385,7 +410,7 @@ pipeline {
                         }
 
                     } else {
-                        echo "No control table entries found — pipelines.json unchanged"
+                        echo "No control table entries found — nothing pushed"
                     }
                 }
             }
