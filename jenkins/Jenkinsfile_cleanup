@@ -1,0 +1,441 @@
+// ============================================================
+// Jenkinsfile_cleanup
+// DATABRICKS-CLEANUP-PIPELINE
+// Deletes control table entries and/or drops Delta tables
+// for a given GROUP_ID across selected workspaces.
+// ============================================================
+
+pipeline {
+
+    agent any
+
+    parameters {
+
+        choice(
+            name: 'WORKSPACE',
+            choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace'],
+            description: 'Target workspace'
+        )
+
+        string(
+            name: 'GROUP_ID',
+            defaultValue: '',
+            description: 'GROUP_ID to delete e.g. WEATHER_L0'
+        )
+
+        booleanParam(
+            name: 'DELETE_CONTROL_HEADER',
+            defaultValue: true,
+            description: 'Delete row from data_flow_control_header'
+        )
+
+        booleanParam(
+            name: 'DELETE_CONTROL_DETAIL',
+            defaultValue: true,
+            description: 'Delete rows from data_flow_l0_detail'
+        )
+
+        booleanParam(
+            name: 'DELETE_AUDIT_LOG',
+            defaultValue: false,
+            description: 'Delete audit_log rows for this GROUP_ID'
+        )
+
+        booleanParam(
+            name: 'DROP_BRONZE_TABLES',
+            defaultValue: false,
+            description: 'DROP the actual bronze Delta tables loaded by this pipeline'
+        )
+
+        booleanParam(
+            name: 'DELETE_DATABRICKS_JOB',
+            defaultValue: false,
+            description: 'Delete the Databricks job for this GROUP_ID'
+        )
+
+        booleanParam(
+            name: 'DELETE_SQL_SCRIPT',
+            defaultValue: false,
+            description: 'Delete META_STORE_SQL_SCRIPTS/{GROUP_ID}.sql from GitHub'
+        )
+    }
+
+    environment {
+        GITHUB_REPO          = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+        GITHUB_API           = 'https://api.github.com'
+        GITHUB_OWNER         = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
+        GITHUB_BRANCH        = 'main'
+        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
+        SQL_SCRIPTS_FOLDER   = 'META_STORE_SQL_SCRIPTS'
+    }
+
+    stages {
+
+        // ========================================================
+        // STAGE 1 — VALIDATE
+        // ========================================================
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!params.GROUP_ID?.trim()) {
+                        error "GROUP_ID must not be empty"
+                    }
+
+                    def anyAction = params.DELETE_CONTROL_HEADER ||
+                                   params.DELETE_CONTROL_DETAIL  ||
+                                   params.DELETE_AUDIT_LOG       ||
+                                   params.DROP_BRONZE_TABLES     ||
+                                   params.DELETE_DATABRICKS_JOB  ||
+                                   params.DELETE_SQL_SCRIPT
+
+                    if (!anyAction) {
+                        error "Select at least one action to perform"
+                    }
+
+                    echo """
+==================================================
+GROUP_ID               : ${params.GROUP_ID}
+WORKSPACE              : ${params.WORKSPACE}
+--------------------------------------------------
+DELETE_CONTROL_HEADER  : ${params.DELETE_CONTROL_HEADER}
+DELETE_CONTROL_DETAIL  : ${params.DELETE_CONTROL_DETAIL}
+DELETE_AUDIT_LOG       : ${params.DELETE_AUDIT_LOG}
+DROP_BRONZE_TABLES     : ${params.DROP_BRONZE_TABLES}
+DELETE_DATABRICKS_JOB  : ${params.DELETE_DATABRICKS_JOB}
+DELETE_SQL_SCRIPT      : ${params.DELETE_SQL_SCRIPT}
+==================================================
+"""
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 2 — CHECKOUT
+        // ========================================================
+
+        stage('Checkout Repo') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.GITHUB_BRANCH}"]],
+                    userRemoteConfigs: [[url: env.GITHUB_REPO]]
+                ])
+                echo "Repo checked out"
+            }
+        }
+
+        // ========================================================
+        // STAGE 3 — LOAD WORKSPACE REGISTRY
+        // ========================================================
+
+        stage('Load Workspace Registry') {
+            steps {
+                script {
+                    def rawText  = readFile('workspaces.json')
+                    def registry = readJSON text: rawText
+
+                    def selected = registry.workspaces.findAll { ws ->
+                        ws.is_active &&
+                        (params.WORKSPACE == 'ALL' || ws.name == params.WORKSPACE)
+                    }
+
+                    if (selected.isEmpty()) {
+                        error "No active workspaces found for: ${params.WORKSPACE}"
+                    }
+
+                    env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: selected)
+
+                    echo "Workspaces selected:"
+                    selected.each { echo "  - ${it.name}" }
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 4 — CLEANUP WORKSPACES (parallel)
+        // ========================================================
+
+        stage('Cleanup') {
+            steps {
+                script {
+
+                    def wsRaw       = env.SELECTED_WORKSPACES
+                    def workspaces  = readJSON text: wsRaw
+                    def parallelMap = [:]
+
+                    workspaces.each { ws ->
+
+                        def wsLocal = ws
+
+                        parallelMap[wsLocal.name] = {
+
+                            withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
+
+                                echo "=================================================="
+                                echo "Cleanup : ${wsLocal.name} | ${params.GROUP_ID}"
+                                echo "=================================================="
+
+                                def catalog = wsLocal.catalog ?: 'demo_catalog'
+                                def wsUrl   = wsLocal.workspace_url
+                                def groupId = params.GROUP_ID
+
+                                // ── Get warehouse ─────────────────────────────
+                                def whRaw  = sh(
+                                    returnStdout: true,
+                                    script: "curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                ).trim()
+
+                                def whJson     = readJSON text: whRaw
+                                def warehouses = whJson.warehouses ?: []
+
+                                if (warehouses.isEmpty()) {
+                                    error "No SQL warehouse in ${wsLocal.name}"
+                                }
+
+                                def warehouseId = warehouses[0].id
+
+                                // ── SQL runner ────────────────────────────────
+                                def runSQL = { String sqlText ->
+                                    def payload = [
+                                        statement       : sqlText,
+                                        warehouse_id    : warehouseId,
+                                        wait_timeout    : '50s',
+                                        on_wait_timeout : 'CANCEL'
+                                    ]
+                                    def payloadJson = writeJSON(returnText: true, json: payload)
+                                    def tmpFile     = "/tmp/cleanup_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                    writeFile file: tmpFile, text: payloadJson
+
+                                    def apiRaw = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X POST '${wsUrl}/api/2.0/sql/statements' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
+                                            -d @${tmpFile}
+                                        """
+                                    ).trim()
+
+                                    sh "rm -f ${tmpFile}"
+
+                                    def apiLines = apiRaw.split('\n')
+                                    def httpCode = apiLines[-1]
+                                    def apiBody  = apiLines[0..-2].join('\n')
+
+                                    if (httpCode != '200') {
+                                        error "SQL API failed HTTP ${httpCode}: ${apiBody}"
+                                    }
+
+                                    def apiJson  = readJSON text: apiBody
+                                    def sqlState = apiJson.status?.state ?: 'UNKNOWN'
+
+                                    if (sqlState == 'FAILED') {
+                                        def errMsg = apiJson.status?.error?.message ?: 'Unknown error'
+                                        error "SQL FAILED: ${errMsg}"
+                                    }
+
+                                    return sqlState
+                                }
+
+                                // ── Query runner (returns rows) ───────────────
+                                def querySQL = { String sqlText ->
+                                    def payload = [
+                                        statement       : sqlText,
+                                        warehouse_id    : warehouseId,
+                                        wait_timeout    : '50s',
+                                        on_wait_timeout : 'CANCEL'
+                                    ]
+                                    def payloadJson = writeJSON(returnText: true, json: payload)
+                                    def tmpFile     = "/tmp/qry_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                    writeFile file: tmpFile, text: payloadJson
+
+                                    def qRaw = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X POST '${wsUrl}/api/2.0/sql/statements' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
+                                            -d @${tmpFile}
+                                        """
+                                    ).trim()
+
+                                    sh "rm -f ${tmpFile}"
+
+                                    def qLines = qRaw.split('\n')
+                                    def qCode  = qLines[-1]
+                                    def qBody  = qLines[0..-2].join('\n')
+
+                                    if (qCode != '200') { return [] }
+
+                                    def qJson = readJSON text: qBody
+                                    if (qJson.status?.state == 'FAILED') { return [] }
+
+                                    return qJson.result?.data_array ?: []
+                                }
+
+                                // ── 1. Delete from control_header ─────────────
+                                if (params.DELETE_CONTROL_HEADER) {
+                                    runSQL("DELETE FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
+                                    echo "  ✅ Deleted from control_header"
+                                }
+
+                                // ── 2. Delete from l0_detail ──────────────────
+                                if (params.DELETE_CONTROL_DETAIL) {
+                                    runSQL("DELETE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
+                                    echo "  ✅ Deleted from l0_detail"
+                                }
+
+                                // ── 3. Delete from audit_log ──────────────────
+                                if (params.DELETE_AUDIT_LOG) {
+                                    runSQL("DELETE FROM ${catalog}.admin.audit_log WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
+                                    echo "  ✅ Deleted from audit_log"
+                                }
+
+                                // ── 4. Drop bronze tables ─────────────────────
+                                if (params.DROP_BRONZE_TABLES) {
+                                    // Read which tables existed for this group
+                                    def tableRows = querySQL(
+                                        "SELECT TARGET_SCHEMA, TARGET_TABLE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'"
+                                    )
+
+                                    if (tableRows.isEmpty()) {
+                                        echo "  ⚠️  No detail rows found — cannot determine tables to drop"
+                                        echo "      Run DROP_BRONZE_TABLES before DELETE_CONTROL_DETAIL next time"
+                                    } else {
+                                        tableRows.each { r ->
+                                            def fullTable = "${catalog}.${r[0]}.${r[1]}"
+                                            runSQL("DROP TABLE IF EXISTS ${fullTable}")
+                                            echo "  ✅ Dropped table: ${fullTable}"
+                                        }
+                                    }
+                                }
+
+                                // ── 5. Delete Databricks job ──────────────────
+                                if (params.DELETE_DATABRICKS_JOB) {
+                                    def listRaw  = sh(
+                                        returnStdout: true,
+                                        script: "curl -s -X GET '${wsUrl}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                    ).trim()
+
+                                    def listJson    = readJSON text: listRaw
+                                    def matchedJob  = listJson.jobs?.find { j ->
+                                        j.settings?.name == groupId
+                                    }
+
+                                    if (matchedJob) {
+                                        def jobId    = matchedJob.job_id
+                                        def delRaw   = sh(
+                                            returnStdout: true,
+                                            script: """
+                                                curl -s -w "\\n%{http_code}" \\
+                                                -X POST '${wsUrl}/api/2.1/jobs/delete' \\
+                                                -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                                -H 'Content-Type: application/json' \\
+                                                -d '{"job_id":${jobId}}'
+                                            """
+                                        ).trim()
+
+                                        def delCode = delRaw.split('\n')[-1]
+                                        if (delCode == '200') {
+                                            echo "  ✅ Deleted Databricks job: ${groupId} (job_id: ${jobId})"
+                                        } else {
+                                            echo "  ⚠️  Job delete HTTP ${delCode}"
+                                        }
+                                    } else {
+                                        echo "  ℹ️  No Databricks job found for: ${groupId}"
+                                    }
+                                }
+
+                                echo "Cleanup complete : ${wsLocal.name}"
+                            }
+                        }
+                    }
+
+                    parallel parallelMap
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 5 — DELETE SQL SCRIPT FROM GITHUB
+        // ========================================================
+
+        stage('Delete SQL Script from GitHub') {
+            when { expression { return params.DELETE_SQL_SCRIPT } }
+            steps {
+                script {
+                    def sqlFileName = "${env.SQL_SCRIPTS_FOLDER}/${params.GROUP_ID}.sql"
+
+                    withCredentials([string(credentialsId: env.GITHUB_CREDENTIAL_ID, variable: 'GH_TOKEN')]) {
+
+                        // Get file SHA
+                        def checkRaw = sh(
+                            returnStdout: true,
+                            script: """
+                                curl -s -w "\\n%{http_code}" \\
+                                -X GET '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/${sqlFileName}?ref=${env.GITHUB_BRANCH}' \\
+                                -H 'Authorization: Bearer ${GH_TOKEN}'
+                            """
+                        ).trim()
+
+                        def checkLines = checkRaw.split('\n')
+                        def checkCode  = checkLines[-1]
+                        def checkBody  = checkLines[0..-2].join('\n')
+
+                        if (checkCode != '200') {
+                            echo "SQL file not found on GitHub: ${sqlFileName} — skipping"
+                            return
+                        }
+
+                        def checkJson  = readJSON text: checkBody
+                        def fileSha    = checkJson.sha
+
+                        def delPayload = [
+                            message : "cleanup: remove ${params.GROUP_ID}.sql [Jenkins]",
+                            sha     : fileSha,
+                            branch  : env.GITHUB_BRANCH
+                        ]
+
+                        def delPayloadJson = writeJSON(returnText: true, json: delPayload)
+                        def delTmpFile     = "/tmp/gh_delete_${System.currentTimeMillis()}.json"
+                        writeFile file: delTmpFile, text: delPayloadJson
+
+                        def delRaw = sh(
+                            returnStdout: true,
+                            script: """
+                                curl -s -w "\\n%{http_code}" \\
+                                -X DELETE '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/${sqlFileName}' \\
+                                -H 'Authorization: Bearer ${GH_TOKEN}' \\
+                                -H 'Content-Type: application/json' \\
+                                -d @${delTmpFile}
+                            """
+                        ).trim()
+
+                        sh "rm -f ${delTmpFile}"
+
+                        def delCode = delRaw.split('\n')[-1]
+
+                        if (delCode == '200') {
+                            echo "✅ Deleted from GitHub: ${sqlFileName}"
+                        } else {
+                            def delBody = delRaw.split('\n')[0..-2].join('\n')
+                            error "GitHub delete failed HTTP ${delCode}: ${delBody}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "GROUP_ID: ${params.GROUP_ID} | WORKSPACE: ${params.WORKSPACE} | STATUS: ${currentBuild.currentResult}"
+        }
+        success { echo "CLEANUP SUCCESS" }
+        failure { echo "CLEANUP FAILED" }
+    }
+}
