@@ -30,9 +30,21 @@ pipeline {
         )
 
         booleanParam(
-            name: 'DELETE_CONTROL_DETAIL',
+            name: 'DELETE_L0_DETAIL',
             defaultValue: true,
-            description: 'Delete rows from data_flow_l0_detail'
+            description: 'Delete rows from data_flow_l0_detail (Bronze)'
+        )
+
+        booleanParam(
+            name: 'DELETE_L1_DETAIL',
+            defaultValue: false,
+            description: 'Delete rows from data_flow_l1_detail (Silver)'
+        )
+
+        booleanParam(
+            name: 'DELETE_L2_DETAIL',
+            defaultValue: false,
+            description: 'Delete rows from data_flow_l2_detail (Gold)'
         )
 
         booleanParam(
@@ -44,7 +56,19 @@ pipeline {
         booleanParam(
             name: 'DROP_BRONZE_TABLES',
             defaultValue: false,
-            description: 'DROP the actual bronze Delta tables loaded by this pipeline'
+            description: 'DROP Bronze Delta tables (reads from l0_detail)'
+        )
+
+        booleanParam(
+            name: 'DROP_SILVER_TABLES',
+            defaultValue: false,
+            description: 'DROP Silver Delta tables (reads from l1_detail)'
+        )
+
+        booleanParam(
+            name: 'DROP_GOLD_TABLES',
+            defaultValue: false,
+            description: 'DROP Gold Delta tables (reads from l2_detail)'
         )
 
         booleanParam(
@@ -84,9 +108,13 @@ pipeline {
                     }
 
                     def anyAction = params.DELETE_CONTROL_HEADER ||
-                                   params.DELETE_CONTROL_DETAIL  ||
+                                   params.DELETE_L0_DETAIL       ||
+                                   params.DELETE_L1_DETAIL       ||
+                                   params.DELETE_L2_DETAIL       ||
                                    params.DELETE_AUDIT_LOG       ||
                                    params.DROP_BRONZE_TABLES     ||
+                                   params.DROP_SILVER_TABLES     ||
+                                   params.DROP_GOLD_TABLES       ||
                                    params.DELETE_DATABRICKS_JOB  ||
                                    params.DELETE_SQL_SCRIPT
 
@@ -100,9 +128,13 @@ GROUP_ID               : ${params.GROUP_ID}
 WORKSPACE              : ${params.WORKSPACE}
 --------------------------------------------------
 DELETE_CONTROL_HEADER  : ${params.DELETE_CONTROL_HEADER}
-DELETE_CONTROL_DETAIL  : ${params.DELETE_CONTROL_DETAIL}
+DELETE_L0_DETAIL       : ${params.DELETE_L0_DETAIL}
+DELETE_L1_DETAIL       : ${params.DELETE_L1_DETAIL}
+DELETE_L2_DETAIL       : ${params.DELETE_L2_DETAIL}
 DELETE_AUDIT_LOG       : ${params.DELETE_AUDIT_LOG}
 DROP_BRONZE_TABLES     : ${params.DROP_BRONZE_TABLES}
+DROP_SILVER_TABLES     : ${params.DROP_SILVER_TABLES}
+DROP_GOLD_TABLES       : ${params.DROP_GOLD_TABLES}
 DELETE_DATABRICKS_JOB  : ${params.DELETE_DATABRICKS_JOB}
 DELETE_SQL_SCRIPT      : ${params.DELETE_SQL_SCRIPT}
 ==================================================
@@ -283,35 +315,51 @@ DELETE_SQL_SCRIPT      : ${params.DELETE_SQL_SCRIPT}
                                     echo "  ✅ Deleted from control_header"
                                 }
 
-                                // ── 2. Delete from l0_detail ──────────────────
-                                if (params.DELETE_CONTROL_DETAIL) {
-                                    runSQL("DELETE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
-                                    echo "  ✅ Deleted from l0_detail"
+                                // ── 2. Drop BEFORE delete (need rows to find table names) ─
+                                def dropLayer = { String detailTable, String layerName ->
+                                    def tRows = querySQL(
+                                        "SELECT TARGET_SCHEMA, TARGET_TABLE FROM ${catalog}.admin.${detailTable} WHERE DATA_FLOW_GROUP_ID = '${groupId}'"
+                                    )
+                                    if (tRows.isEmpty()) {
+                                        echo "  ⚠️  No rows in ${detailTable} — cannot determine tables to drop"
+                                    } else {
+                                        tRows.each { r ->
+                                            def fullTable = "${catalog}.${r[0]}.${r[1]}"
+                                            runSQL("DROP TABLE IF EXISTS ${fullTable}")
+                                            echo "  ✅ Dropped ${layerName} table: ${fullTable}"
+                                        }
+                                    }
                                 }
 
-                                // ── 3. Delete from audit_log ──────────────────
+                                // Always drop BEFORE deleting detail rows
+                                if (params.DROP_BRONZE_TABLES) {
+                                    dropLayer('data_flow_l0_detail', 'Bronze')
+                                }
+                                if (params.DROP_SILVER_TABLES) {
+                                    dropLayer('data_flow_l1_detail', 'Silver')
+                                }
+                                if (params.DROP_GOLD_TABLES) {
+                                    dropLayer('data_flow_l2_detail', 'Gold')
+                                }
+
+                                // ── 3. Delete detail rows ─────────────────────
+                                if (params.DELETE_L0_DETAIL) {
+                                    runSQL("DELETE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
+                                    echo "  ✅ Deleted from l0_detail (Bronze)"
+                                }
+                                if (params.DELETE_L1_DETAIL) {
+                                    runSQL("DELETE FROM ${catalog}.admin.data_flow_l1_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
+                                    echo "  ✅ Deleted from l1_detail (Silver)"
+                                }
+                                if (params.DELETE_L2_DETAIL) {
+                                    runSQL("DELETE FROM ${catalog}.admin.data_flow_l2_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
+                                    echo "  ✅ Deleted from l2_detail (Gold)"
+                                }
+
+                                // ── 4. Delete from audit_log ──────────────────
                                 if (params.DELETE_AUDIT_LOG) {
                                     runSQL("DELETE FROM ${catalog}.admin.audit_log WHERE DATA_FLOW_GROUP_ID = '${groupId}'")
                                     echo "  ✅ Deleted from audit_log"
-                                }
-
-                                // ── 4. Drop bronze tables ─────────────────────
-                                if (params.DROP_BRONZE_TABLES) {
-                                    // Read which tables existed for this group
-                                    def tableRows = querySQL(
-                                        "SELECT TARGET_SCHEMA, TARGET_TABLE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}'"
-                                    )
-
-                                    if (tableRows.isEmpty()) {
-                                        echo "  ⚠️  No detail rows found — cannot determine tables to drop"
-                                        echo "      Run DROP_BRONZE_TABLES before DELETE_CONTROL_DETAIL next time"
-                                    } else {
-                                        tableRows.each { r ->
-                                            def fullTable = "${catalog}.${r[0]}.${r[1]}"
-                                            runSQL("DROP TABLE IF EXISTS ${fullTable}")
-                                            echo "  ✅ Dropped table: ${fullTable}"
-                                        }
-                                    }
                                 }
 
                                 // ── 5. Delete Databricks job ──────────────────
