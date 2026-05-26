@@ -1,7 +1,7 @@
 -- ==============================================
 -- Workspace : karthik_workspace
 -- Group     : FINANCE_MEDALLION_L0
--- Generated : 2026-05-26 07:17:33
+-- Generated : 2026-05-26 15:20:44
 -- ==============================================
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
