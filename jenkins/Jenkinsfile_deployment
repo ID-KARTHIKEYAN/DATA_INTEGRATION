@@ -17,16 +17,10 @@ pipeline {
             description: 'Deploy to specific workspace or ALL'
         )
 
-        string(
-            name: 'SQL_FILE',
-            defaultValue: '',
-            description: 'Specific .sql filename to run e.g. WEATHER_L0.sql — leave blank to run ALL files'
-        )
-
         booleanParam(
             name: 'CREATE_TABLES',
             defaultValue: true,
-            description: 'Create control tables if they do not exist'
+            description: 'Create schema and control tables if they do not exist'
         )
     }
 
@@ -54,13 +48,12 @@ pipeline {
         }
 
         // ========================================================
-        // STAGE 2 — LOAD CONFIG + DISCOVER SQL FILES
+        // STAGE 2 — LOAD WORKSPACE REGISTRY
         // ========================================================
 
-        stage('Load Config') {
+        stage('Load Workspace Registry') {
             steps {
                 script {
-
                     def wsRaw      = readFile('workspaces.json')
                     def wsRegistry = readJSON text: wsRaw
 
@@ -75,53 +68,22 @@ pipeline {
 
                     env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: selected)
 
-                    // Discover which .sql files to run
-                    def sqlFiles = []
-
-                    if (params.SQL_FILE?.trim()) {
-                        // Single file specified
-                        sqlFiles = ["${env.SQL_SCRIPTS_FOLDER}/${params.SQL_FILE}"]
-                    } else {
-                        // Find all .sql files in the folder
-                        def found = sh(
-                            returnStdout: true,
-                            script: "find ${env.SQL_SCRIPTS_FOLDER} -name '*.sql' 2>/dev/null | sort || echo ''"
-                        ).trim()
-
-                        if (found) {
-                            sqlFiles = found.split('\n').findAll { it?.trim() }
-                        }
-                    }
-
-                    if (sqlFiles.isEmpty()) {
-                        error "No .sql files found in ${env.SQL_SCRIPTS_FOLDER}/. Run the main pipeline first to generate them."
-                    }
-
-                    env.SQL_FILES_JSON = writeJSON(returnText: true, json: sqlFiles)
-
                     echo "Workspaces to deploy:"
                     selected.each { echo "  - ${it.name}" }
-
-                    echo "SQL files to run:"
-                    sqlFiles.each { echo "  - ${it}" }
                 }
             }
         }
 
         // ========================================================
-        // STAGE 3 — DEPLOY TO ALL WORKSPACES (parallel)
+        // STAGE 3 — CREATE SCHEMAS + TABLES ONLY (DDL — no data inserted)
         // ========================================================
 
-        stage('Deploy Framework Tables') {
+        stage('Create Schemas and Tables') {
             steps {
                 script {
 
                     def wsRaw       = env.SELECTED_WORKSPACES
                     def workspaces  = readJSON text: wsRaw
-
-                    def sfRaw       = env.SQL_FILES_JSON
-                    def sqlFiles    = readJSON text: sfRaw
-
                     def parallelMap = [:]
 
                     workspaces.each { ws ->
@@ -208,36 +170,20 @@ pipeline {
                                     echo "  control_header — done"
 
                                     runSQL("CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l0_detail (DATA_FLOW_GROUP_ID STRING NOT NULL, SOURCE_URL STRING, TARGET_SCHEMA STRING, TARGET_TABLE STRING, FILE_FORMAT STRING, LOAD_TYPE STRING, IS_ACTIVE STRING, CREATED_DATE TIMESTAMP, UPDATED_DATE TIMESTAMP) USING DELTA")
+                                    echo "  l0_detail        — done"
+
+                                    runSQL("CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l1_detail (DATA_FLOW_GROUP_ID STRING NOT NULL, SOURCE_OBJ_SCHEMA STRING, SOURCE_OBJ_NAME STRING, TARGET_SCHEMA STRING, TARGET_TABLE STRING, LOAD_TYPE STRING, TRANSFORMATION_QUERY STRING, MERGE_KEYS STRING, PARTITION_BY STRING, DQ_LOGIC STRING, IS_ACTIVE STRING, CREATED_DATE TIMESTAMP, UPDATED_DATE TIMESTAMP) USING DELTA")
+                                    echo "  l1_detail        — done"
+
+                                    runSQL("CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l2_detail (DATA_FLOW_GROUP_ID STRING NOT NULL, SOURCE_OBJ_SCHEMA STRING, SOURCE_OBJ_NAME STRING, TARGET_SCHEMA STRING, TARGET_TABLE STRING, LOAD_TYPE STRING, TRANSFORMATION_QUERY STRING, MERGE_KEYS STRING, PARTITION_BY STRING, IS_ACTIVE STRING, CREATED_DATE TIMESTAMP, UPDATED_DATE TIMESTAMP) USING DELTA")
+                                    echo "  l2_detail        — done"
                                     echo "  l0_detail — done"
 
                                     runSQL("CREATE TABLE IF NOT EXISTS ${catalog}.admin.audit_log (DATA_FLOW_GROUP_ID STRING, TARGET_TABLE STRING, STATUS STRING, MESSAGE STRING, LOAD_TS TIMESTAMP) USING DELTA")
                                     echo "  audit_log — done"
                                 }
 
-                                // ── STEP 2 : Run each SQL file ────────────────
-                                echo "  Running SQL scripts..."
-
-                                sqlFiles.each { sqlFile ->
-
-                                    def sqlContent = readFile(sqlFile).trim()
-
-                                    // Split on semicolon — each MERGE is one statement
-                                    def statements = sqlContent
-                                        .split(';')
-                                        .collect { it.trim() }
-                                        .findAll { it && !it.startsWith('--') && it.length() > 10 }
-
-                                    def sqlName = sqlFile.split('/')[-1]
-                                    echo "  Running : ${sqlName} (${statements.size()} statements)"
-
-                                    statements.each { stmt ->
-                                        runSQL(stmt)
-                                    }
-
-                                    echo "  ✅ ${sqlName} — done"
-                                }
-
-                                echo "Deployment complete : ${wsLocal.name}"
+                                echo "Schema + tables created : ${wsLocal.name}"
                             }
                         }
                     }
@@ -252,7 +198,7 @@ pipeline {
         always {
             echo "WORKSPACE: ${params.WORKSPACE} | STATUS: ${currentBuild.currentResult}"
         }
-        success { echo "DEPLOYMENT SUCCESS" }
-        failure { echo "DEPLOYMENT FAILED" }
+        success { echo "SCHEMA DEPLOYMENT SUCCESS" }
+        failure { echo "SCHEMA DEPLOYMENT FAILED" }
     }
 }
