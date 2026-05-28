@@ -23,11 +23,11 @@
     {
       "name": "user3_workspace",
       "owner": "User3",
-      "workspace_url": "https://dbc-ZZZZZZZZ-ZZZZ.cloud.databricks.com",
-      "job_id": "000000000000002",
-      "credential_id": "DATABRICKS_TOKEN_USER3",
+      "workspace_url": "https://dbc-52566953-f07e.cloud.databricks.com",
+      "job_id": "2514585521553695",
+      "credential_id": "ADMIN_TEST_TOKEN",
       "catalog": "demo_catalog",
-      "github_repo_path": "/Workspace/Repos/user3@gmail.com/DATA_INTEGRATION",
+      "github_repo_path": "/Workspace/Repos/chennaigusts@gmail.com/DATA_INTEGRATION",
       "is_active": true
     }
   ],
