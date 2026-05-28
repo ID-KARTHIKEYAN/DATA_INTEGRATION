@@ -3,7 +3,8 @@
 -- Sample Medallion project — Finance data
 -- Uses free GitHub CSV datasets
 -- =============================================================
-
+CREATE CATALOG IF NOT EXISTS demo_catalog;
+CREATE SCHEMA IF NOT EXISTS demo_catalog.admin;
 -- ── Header ────────────────────────────────────────────────────
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (
