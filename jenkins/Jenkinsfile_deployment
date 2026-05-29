@@ -336,42 +336,81 @@ pipeline {
                                 def catCode  = catLines[-1]
                                 def catBody  = catLines[0..-2].join('\n')
 
+                                // Read-only catalogs that must never be used for DDL.
+                                // 'samples'  — Databricks sample data, always read-only
+                                // 'system'   — internal system catalog, always read-only
+                                def READ_ONLY_CATALOGS = ['samples', 'system']
+
+                                // Preferred writable fallback order when the configured catalog
+                                // is missing. 'workspace' is the default UC catalog in new
+                                // Databricks workspaces; 'hive_metastore' covers classic/free.
+                                def WRITABLE_FALLBACK_PREFERENCE = ['workspace', 'hive_metastore']
+
                                 if (catCode == '200') {
                                     def catJson  = readJSON text: catBody
                                     def catRows  = catJson.result?.data_array ?: []
                                     def catNames = catRows.collect { it[0] }
                                     echo "  Available catalogs : ${catNames.join(', ')}"
 
-                                    if (catNames.contains(catalog)) {
+                                    if (catNames.contains(catalog) && !READ_ONLY_CATALOGS.contains(catalog)) {
+                                        // Configured catalog exists and is not read-only — use it
                                         resolvedCatalog = catalog
                                         echo "  ✅ Using catalog : ${resolvedCatalog}"
-                                    } else if (catNames.contains('hive_metastore')) {
-                                        // [FIX] Explicit safe fallback for free/community edition
-                                        resolvedCatalog = 'hive_metastore'
-                                        echo "  ⚠️  '${catalog}' not found — falling back to hive_metastore"
-                                    } else if (!catNames.isEmpty()) {
-                                        resolvedCatalog = catNames[0]
-                                        echo "  ⚠️  '${catalog}' not found — using first available: ${resolvedCatalog}"
+                                    } else if (catNames.contains(catalog) && READ_ONLY_CATALOGS.contains(catalog)) {
+                                        // Configured catalog exists but is read-only — warn and fall through
+                                        echo "  ⚠️  '${catalog}' is a read-only catalog — cannot create schemas in it"
+                                        def preferred = WRITABLE_FALLBACK_PREFERENCE.find { catNames.contains(it) }
+                                        if (preferred) {
+                                            resolvedCatalog = preferred
+                                            echo "  ⚠️  Falling back to writable catalog: ${resolvedCatalog}"
+                                        } else {
+                                            // Filter out all known read-only catalogs and pick first remaining
+                                            def writableCandidates = catNames.findAll { !READ_ONLY_CATALOGS.contains(it) }
+                                            if (writableCandidates) {
+                                                resolvedCatalog = writableCandidates[0]
+                                                echo "  ⚠️  Using first non-read-only catalog: ${resolvedCatalog}"
+                                            } else {
+                                                error "All available catalogs (${catNames.join(', ')}) are read-only. " +
+                                                      "Please create a Unity Catalog or set an explicit writable catalog " +
+                                                      "in workspaces.json for workspace '${wsLocal.name}'."
+                                            }
+                                        }
                                     } else {
-                                        // [FIX] No catalogs listed at all — hard fail with clear message
-                                        //       instead of blindly proceeding with a missing catalog name
-                                        error "No catalogs returned for workspace '${wsLocal.name}'. " +
-                                              "Ensure the service principal has USE CATALOG privilege or " +
-                                              "set an explicit catalog in workspaces.json."
+                                        // Configured catalog not found — try preferred writable fallbacks
+                                        echo "  ⚠️  '${catalog}' not found in available catalogs"
+                                        def preferred = WRITABLE_FALLBACK_PREFERENCE.find { catNames.contains(it) }
+                                        if (preferred) {
+                                            resolvedCatalog = preferred
+                                            echo "  ⚠️  Falling back to : ${resolvedCatalog}"
+                                        } else {
+                                            // No preferred fallback found — pick first non-read-only catalog
+                                            def writableCandidates = catNames.findAll { !READ_ONLY_CATALOGS.contains(it) }
+                                            if (writableCandidates) {
+                                                resolvedCatalog = writableCandidates[0]
+                                                echo "  ⚠️  No preferred catalog found — using first writable catalog: ${resolvedCatalog}"
+                                            } else if (!catNames.isEmpty()) {
+                                                error "All available catalogs (${catNames.join(', ')}) are read-only. " +
+                                                      "Please create a Unity Catalog or set an explicit writable catalog " +
+                                                      "in workspaces.json for workspace '${wsLocal.name}'."
+                                            } else {
+                                                error "No catalogs returned for workspace '${wsLocal.name}'. " +
+                                                      "Ensure the service principal has USE CATALOG privilege or " +
+                                                      "set an explicit catalog in workspaces.json."
+                                            }
+                                        }
                                     }
                                 } else {
-                                    // [FIX] SHOW CATALOGS call itself failed (auth error, network, etc.)
-                                    //       Previously this silently continued with the original (broken) catalog.
-                                    //       Now we fall back to hive_metastore and log a clear warning so the
-                                    //       operator knows to investigate.
+                                    // SHOW CATALOGS API call itself failed (auth error, network, etc.)
+                                    // If the user explicitly configured a non-default catalog, trust it.
+                                    // Otherwise hard-fail — better to stop here than silently DDL into the wrong place.
                                     echo "  ⚠️  SHOW CATALOGS returned HTTP ${catCode} — response: ${catBody}"
-                                    if (catalog == env.DEFAULT_CATALOG || catalog == 'demo_catalog') {
-                                        resolvedCatalog = 'hive_metastore'
-                                        echo "  ⚠️  Defaulting to hive_metastore (catalog check failed and no explicit catalog set)"
-                                    } else {
-                                        // User explicitly set a catalog — trust it but warn loudly
+                                    if (catalog != env.DEFAULT_CATALOG && catalog != 'demo_catalog' && catalog != 'hive_metastore') {
                                         resolvedCatalog = catalog
                                         echo "  ⚠️  Proceeding with explicitly configured catalog '${catalog}' despite check failure"
+                                    } else {
+                                        error "Could not list catalogs (HTTP ${catCode}) and no explicit catalog is set for " +
+                                              "workspace '${wsLocal.name}'. Set the 'catalog' field in workspaces.json " +
+                                              "to the correct catalog name (e.g. 'workspace') and retry."
                                     }
                                 }
 
