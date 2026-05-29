@@ -10,18 +10,18 @@
 //   [NEW] Stage 2.5 — Auto-register new workspace into workspaces.json
 //   [NEW] Stage 4   — Deploy notebooks from GitHub Repo to each workspace
 //   [MOD] Catalog is now read per-workspace from workspaces.json
-//         (was hardcoded to demo_catalog)
 //   [MOD] CREATE TABLE now creates Bronze / Silver / Gold schemas too
 //   [KEEP] All existing stages, structure, SQL runner unchanged
 // ============================================================
 // FIXES:
-//   [FIX] Catalog fallback now uses hive_metastore (not demo_catalog)
-//         when CATALOG_OVERRIDE is blank and catalog check HTTP != 200
-//   [FIX] DEFAULT_CATALOG changed from 'demo_catalog' to 'hive_metastore'
-//         so free/community Databricks workspaces work out of the box
-//   [FIX] SHOW CATALOGS failure no longer silently proceeds with a
-//         non-existent catalog — it now falls back to hive_metastore
-//   [FIX] CATALOG_OVERRIDE description updated to reflect new default
+//   [FIX] Removed unreliable auto-detect fallback that was silently
+//         picking read-only catalogs (samples, system) causing PERMISSION_DENIED
+//   [FIX] Pipeline now runs CREATE CATALOG IF NOT EXISTS before any DDL,
+//         so the catalog is auto-created if it does not exist yet
+//   [FIX] Each workspace gets its own named catalog from workspaces.json
+//         (e.g. demo_catalog, maran_catalog, user3_catalog)
+//   [FIX] DEFAULT_CATALOG changed to 'demo_catalog' — set per workspace
+//         in workspaces.json to override
 // ============================================================
 
 pipeline {
@@ -60,15 +60,14 @@ pipeline {
         string(
             name: 'CATALOG_OVERRIDE',
             defaultValue: '',
-            // [FIX] Updated description — default is now hive_metastore, not demo_catalog
-            description: '[NEW] Override catalog for new workspace. Leave blank to use hive_metastore (auto-detected)'
+            description: '[NEW] Catalog name for the new workspace. e.g. john_catalog. Leave blank to use demo_catalog'
         )
 
         // ── Existing parameter ────────────────────────────────
         booleanParam(
             name: 'CREATE_TABLES',
             defaultValue: true,
-            description: 'Create admin schema + all 5 control tables (DDL only — no data)'
+            description: 'Create catalog + admin/bronze/silver/gold schemas + all 5 control tables (DDL only — no data)'
         )
 
         // ── [NEW] Notebook deployment ─────────────────────────
@@ -86,10 +85,9 @@ pipeline {
         GITHUB_API           = 'https://api.github.com'
         GITHUB_OWNER         = 'ID-KARTHIKEYAN'
         GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
-        // [FIX] Changed from 'demo_catalog' to 'hive_metastore'
-        //       hive_metastore exists in ALL Databricks workspaces by default.
-        //       Unity Catalog users: set CATALOG_OVERRIDE or update workspaces.json per workspace.
-        DEFAULT_CATALOG      = 'hive_metastore'
+        // Each workspace should have its own catalog set in workspaces.json.
+        // This is used only if workspaces.json entry has no catalog field.
+        DEFAULT_CATALOG      = 'demo_catalog'
     }
 
     stages {
@@ -111,7 +109,6 @@ pipeline {
 
         // ========================================================
         // STAGE 2 — LOAD WORKSPACE REGISTRY
-        // [MOD] Now also picks up newly registered workspace
         // ========================================================
 
         stage('Load Workspace Registry') {
@@ -129,17 +126,15 @@ pipeline {
                             workspace_url    : params.NEW_WORKSPACE_URL.trim(),
                             job_id           : 'PENDING',
                             credential_id    : params.NEW_CREDENTIAL_ID?.trim() ?: "DATABRICKS_TOKEN_${params.NEW_WORKSPACE_NAME.trim().toUpperCase()}",
-                            // [FIX] Fallback to DEFAULT_CATALOG (hive_metastore) not demo_catalog
                             catalog          : params.CATALOG_OVERRIDE?.trim() ?: env.DEFAULT_CATALOG,
                             github_repo_path : "/Workspace/Repos/admin/DATA_INTEGRATION",
                             is_active        : true
                         ]
 
-                        // Only add if not already present
                         def already = wsRegistry.workspaces.find { it.name == newEntry.name }
                         if (!already) {
                             wsRegistry.workspaces.add(newEntry)
-                            echo "[NEW] Registered workspace: ${newEntry.name}"
+                            echo "[NEW] Registered workspace: ${newEntry.name} | catalog: ${newEntry.catalog}"
                         } else {
                             echo "[NEW] Workspace already exists: ${newEntry.name} — skipping add"
                         }
@@ -167,9 +162,7 @@ pipeline {
         }
 
         // ========================================================
-        // STAGE 2.5 — [NEW] DEPLOY NOTEBOOKS VIA REPOS API
-        // Connects GitHub repo to each workspace so notebooks
-        // are available at github_repo_path automatically
+        // STAGE 2.5 — DEPLOY NOTEBOOKS VIA REPOS API
         // ========================================================
 
         stage('Deploy Notebooks') {
@@ -177,8 +170,8 @@ pipeline {
             steps {
                 script {
 
-                    def wsRaw      = env.SELECTED_WORKSPACES
-                    def workspaces = readJSON text: wsRaw
+                    def wsRaw       = env.SELECTED_WORKSPACES
+                    def workspaces  = readJSON text: wsRaw
                     def parallelMap = [:]
 
                     workspaces.each { ws ->
@@ -222,7 +215,7 @@ pipeline {
                                     }
 
                                 } else {
-                                    // [NEW] Not connected — create repo connection
+                                    // Not connected — create repo connection
                                     def createPayload = [
                                         url      : env.GITHUB_REPO,
                                         provider : 'gitHub',
@@ -265,11 +258,10 @@ pipeline {
         }
 
         // ========================================================
-        // STAGE 3 — CREATE SCHEMAS + TABLES (DDL only, no data)
-        // [MOD] Catalog now read per-workspace from registry
-        // [MOD] Also creates Bronze / Silver / Gold schemas
-        // [MOD] control_header includes new Medallion columns
-        // [KEEP] SQL runner, warehouse fetch, temp file approach
+        // STAGE 3 — CREATE CATALOG + SCHEMAS + TABLES
+        // Each workspace gets its own named catalog from
+        // workspaces.json (e.g. demo_catalog, maran_catalog).
+        // Catalog is created automatically if it does not exist.
         // ========================================================
 
         stage('Create Schemas and Tables') {
@@ -293,13 +285,16 @@ pipeline {
                                 echo "Deploying to : ${wsLocal.name}"
                                 echo "=================================================="
 
-                                // [MOD] Read catalog per workspace — fallback to default
+                                // Catalog is set per-workspace in workspaces.json.
+                                // e.g. karthik_workspace → demo_catalog
+                                //      MARAN_workspace   → maran_catalog
+                                //      user3_workspace   → user3_catalog
                                 def catalog = wsLocal.catalog ?: env.DEFAULT_CATALOG
                                 def wsUrl   = wsLocal.workspace_url
 
-                                echo "  Configured catalog : ${catalog}"
+                                echo "  Catalog : ${catalog}"
 
-                                // ── Get warehouse ─────────────────────────────
+                                // ── Get SQL warehouse ─────────────────────────
                                 def whRaw  = sh(
                                     returnStdout: true,
                                     script: "curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
@@ -314,109 +309,6 @@ pipeline {
 
                                 def warehouseId = warehouses[0].id
                                 echo "  Warehouse : ${warehouseId}"
-
-                                // ── Auto-detect catalog ───────────────────────
-                                // Run SHOW CATALOGS and resolve the best available
-                                // catalog. Falls back safely to hive_metastore so
-                                // the pipeline never fires DDL against a missing catalog.
-                                def resolvedCatalog = catalog
-
-                                def catCheckRaw = sh(
-                                    returnStdout: true,
-                                    script: """
-                                        curl -s -w "\\n%{http_code}" \\
-                                        -X POST '${wsUrl}/api/2.0/sql/statements' \\
-                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
-                                        -H 'Content-Type: application/json' \\
-                                        -d '{"statement":"SHOW CATALOGS","warehouse_id":"${warehouseId}","wait_timeout":"30s","on_wait_timeout":"CANCEL"}'
-                                    """
-                                ).trim()
-
-                                def catLines = catCheckRaw.split('\n')
-                                def catCode  = catLines[-1]
-                                def catBody  = catLines[0..-2].join('\n')
-
-                                // Read-only catalogs that must never be used for DDL.
-                                // 'samples'  — Databricks sample data, always read-only
-                                // 'system'   — internal system catalog, always read-only
-                                def READ_ONLY_CATALOGS = ['samples', 'system']
-
-                                // Preferred writable fallback order when the configured catalog
-                                // is missing. 'workspace' is the default UC catalog in new
-                                // Databricks workspaces; 'hive_metastore' covers classic/free.
-                                def WRITABLE_FALLBACK_PREFERENCE = ['workspace', 'hive_metastore']
-
-                                if (catCode == '200') {
-                                    def catJson  = readJSON text: catBody
-                                    def catRows  = catJson.result?.data_array ?: []
-                                    def catNames = catRows.collect { it[0] }
-                                    echo "  Available catalogs : ${catNames.join(', ')}"
-
-                                    if (catNames.contains(catalog) && !READ_ONLY_CATALOGS.contains(catalog)) {
-                                        // Configured catalog exists and is not read-only — use it
-                                        resolvedCatalog = catalog
-                                        echo "  ✅ Using catalog : ${resolvedCatalog}"
-                                    } else if (catNames.contains(catalog) && READ_ONLY_CATALOGS.contains(catalog)) {
-                                        // Configured catalog exists but is read-only — warn and fall through
-                                        echo "  ⚠️  '${catalog}' is a read-only catalog — cannot create schemas in it"
-                                        def preferred = WRITABLE_FALLBACK_PREFERENCE.find { catNames.contains(it) }
-                                        if (preferred) {
-                                            resolvedCatalog = preferred
-                                            echo "  ⚠️  Falling back to writable catalog: ${resolvedCatalog}"
-                                        } else {
-                                            // Filter out all known read-only catalogs and pick first remaining
-                                            def writableCandidates = catNames.findAll { !READ_ONLY_CATALOGS.contains(it) }
-                                            if (writableCandidates) {
-                                                resolvedCatalog = writableCandidates[0]
-                                                echo "  ⚠️  Using first non-read-only catalog: ${resolvedCatalog}"
-                                            } else {
-                                                error "All available catalogs (${catNames.join(', ')}) are read-only. " +
-                                                      "Please create a Unity Catalog or set an explicit writable catalog " +
-                                                      "in workspaces.json for workspace '${wsLocal.name}'."
-                                            }
-                                        }
-                                    } else {
-                                        // Configured catalog not found — try preferred writable fallbacks
-                                        echo "  ⚠️  '${catalog}' not found in available catalogs"
-                                        def preferred = WRITABLE_FALLBACK_PREFERENCE.find { catNames.contains(it) }
-                                        if (preferred) {
-                                            resolvedCatalog = preferred
-                                            echo "  ⚠️  Falling back to : ${resolvedCatalog}"
-                                        } else {
-                                            // No preferred fallback found — pick first non-read-only catalog
-                                            def writableCandidates = catNames.findAll { !READ_ONLY_CATALOGS.contains(it) }
-                                            if (writableCandidates) {
-                                                resolvedCatalog = writableCandidates[0]
-                                                echo "  ⚠️  No preferred catalog found — using first writable catalog: ${resolvedCatalog}"
-                                            } else if (!catNames.isEmpty()) {
-                                                error "All available catalogs (${catNames.join(', ')}) are read-only. " +
-                                                      "Please create a Unity Catalog or set an explicit writable catalog " +
-                                                      "in workspaces.json for workspace '${wsLocal.name}'."
-                                            } else {
-                                                error "No catalogs returned for workspace '${wsLocal.name}'. " +
-                                                      "Ensure the service principal has USE CATALOG privilege or " +
-                                                      "set an explicit catalog in workspaces.json."
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // SHOW CATALOGS API call itself failed (auth error, network, etc.)
-                                    // If the user explicitly configured a non-default catalog, trust it.
-                                    // Otherwise hard-fail — better to stop here than silently DDL into the wrong place.
-                                    echo "  ⚠️  SHOW CATALOGS returned HTTP ${catCode} — response: ${catBody}"
-                                    if (catalog != env.DEFAULT_CATALOG && catalog != 'demo_catalog' && catalog != 'hive_metastore') {
-                                        resolvedCatalog = catalog
-                                        echo "  ⚠️  Proceeding with explicitly configured catalog '${catalog}' despite check failure"
-                                    } else {
-                                        error "Could not list catalogs (HTTP ${catCode}) and no explicit catalog is set for " +
-                                              "workspace '${wsLocal.name}'. Set the 'catalog' field in workspaces.json " +
-                                              "to the correct catalog name (e.g. 'workspace') and retry."
-                                    }
-                                }
-
-                                // Override catalog with resolved value for all DDL below
-                                catalog = resolvedCatalog
-                                echo "  Final catalog for DDL : ${catalog}"
 
                                 // ── SQL runner ────────────────────────────────
                                 def runSQL = { String sqlText ->
@@ -460,13 +352,20 @@ pipeline {
                                     }
                                 }
 
+                                // ── [FIX] Step 0: Create catalog if not exists ─
+                                // This is what was missing — without this, the pipeline
+                                // would fail with NO_SUCH_CATALOG_EXCEPTION if the catalog
+                                // had not been created yet in this workspace.
+                                echo "  Creating catalog if not exists : ${catalog}"
+                                runSQL("CREATE CATALOG IF NOT EXISTS ${catalog}")
+                                echo "  ✅ Catalog ready : ${catalog}"
+
+                                // ── Step 1: Create schemas ─────────────────────
                                 echo "  Creating schemas..."
 
-                                // ── Admin schema + control tables ─────────────
                                 runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.admin")
                                 echo "  ${catalog}.admin — done"
 
-                                // [MOD] Medallion data schemas
                                 runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.bronze")
                                 echo "  ${catalog}.bronze — done"
 
@@ -476,9 +375,10 @@ pipeline {
                                 runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.gold")
                                 echo "  ${catalog}.gold — done"
 
+                                // ── Step 2: Create control tables ─────────────
                                 echo "  Creating control tables..."
 
-                                // control_header — [MOD] includes Medallion columns
+                                // control_header
                                 runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_control_header (
                                     DATA_FLOW_GROUP_ID     STRING NOT NULL,
                                     JOB_NAME               STRING,
@@ -566,7 +466,7 @@ pipeline {
                                 ) USING DELTA""")
                                 echo "  l2_detail — done"
 
-                                // audit_log — full Medallion columns
+                                // audit_log
                                 runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.audit_log (
                                     DATA_FLOW_GROUP_ID  STRING,
                                     TARGET_TABLE        STRING,
@@ -580,7 +480,7 @@ pipeline {
                                 ) USING DELTA""")
                                 echo "  audit_log — done"
 
-                                echo "✅ All schemas and tables ready : ${wsLocal.name}"
+                                echo "✅ All schemas and tables ready : ${wsLocal.name} | catalog: ${catalog}"
                             }
                         }
                     }
