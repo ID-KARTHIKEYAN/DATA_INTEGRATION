@@ -1,7 +1,7 @@
 -- ==============================================
 -- Workspace : MARAN_workspace
 -- Group     : FINANCE_MEDALLION_L0
--- Generated : 2026-05-29 11:01:17
+-- Generated : 2026-05-29 11:18:22
 -- ==============================================
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
