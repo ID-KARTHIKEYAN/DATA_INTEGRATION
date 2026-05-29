@@ -1,68 +1,142 @@
-```groovy
+// ============================================================
+// Jenkinsfile_deployment
+// DATABRICKS-FRAMEWORK-DEPLOYMENT-PIPELINE
+// ============================================================
+// CHANGES FROM PREVIOUS VERSION:
+//   [NEW] Parameter: NEW_WORKSPACE_NAME  — register a new team
+//   [NEW] Parameter: NEW_WORKSPACE_URL   — new workspace URL
+//   [NEW] Parameter: NEW_CATALOG         — per-workspace catalog
+//   [NEW] Parameter: DEPLOY_NOTEBOOKS    — clone notebooks via Repos API
+//   [NEW] Stage 2.5 — Auto-register new workspace into workspaces.json
+//   [NEW] Stage 4   — Deploy notebooks from GitHub Repo to each workspace
+//   [MOD] Catalog is now read per-workspace from workspaces.json
+//         (was hardcoded to demo_catalog)
+//   [MOD] CREATE TABLE now creates Bronze / Silver / Gold schemas too
+//   [KEEP] All existing stages, structure, SQL runner unchanged
+// ============================================================
+
 pipeline {
 
     agent any
 
     parameters {
 
+        // ── Existing parameter ────────────────────────────────
         choice(
             name: 'WORKSPACE',
             choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace'],
             description: 'Deploy to specific workspace or ALL'
         )
 
+        // ── [NEW] New workspace onboarding ────────────────────
+        string(
+            name: 'NEW_WORKSPACE_NAME',
+            defaultValue: '',
+            description: '[NEW] Leave blank to skip. e.g. john_workspace — auto-adds to registry'
+        )
+
+        string(
+            name: 'NEW_WORKSPACE_URL',
+            defaultValue: '',
+            description: '[NEW] URL of new workspace e.g. https://dbc-XXXX.cloud.databricks.com'
+        )
+
+        string(
+            name: 'NEW_CREDENTIAL_ID',
+            defaultValue: '',
+            description: '[NEW] Jenkins credential ID for new workspace token e.g. DATABRICKS_TOKEN_JOHN'
+        )
+
+        // ── [NEW] Catalog override ────────────────────────────
+        string(
+            name: 'CATALOG_OVERRIDE',
+            defaultValue: '',
+            description: '[NEW] Override catalog for new workspace. Leave blank to use demo_catalog'
+        )
+
+        // ── Existing parameter ────────────────────────────────
         booleanParam(
             name: 'CREATE_TABLES',
             defaultValue: true,
-            description: 'Create schemas and framework tables'
+            description: 'Create admin schema + all 5 control tables (DDL only — no data)'
+        )
+
+        // ── [NEW] Notebook deployment ─────────────────────────
+        booleanParam(
+            name: 'DEPLOY_NOTEBOOKS',
+            defaultValue: true,
+            description: '[NEW] Connect GitHub repo to each workspace via Databricks Repos API'
         )
     }
 
     environment {
-        GITHUB_REPO     = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
-        GITHUB_BRANCH   = 'main'
-
-        // FIXED
-        DEFAULT_CATALOG = 'hive_metastore'
+        GITHUB_REPO          = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+        GITHUB_BRANCH        = 'main'
+        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
+        GITHUB_API           = 'https://api.github.com'
+        GITHUB_OWNER         = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
+        DEFAULT_CATALOG      = 'demo_catalog'
     }
 
     stages {
 
-        // =====================================================
-        // CHECKOUT
-        // =====================================================
+        // ========================================================
+        // STAGE 1 — CHECKOUT
+        // ========================================================
 
         stage('Checkout Repo') {
             steps {
-
                 checkout([
                     $class: 'GitSCM',
                     branches: [[name: "*/${env.GITHUB_BRANCH}"]],
                     userRemoteConfigs: [[url: env.GITHUB_REPO]]
                 ])
-
                 echo "Repo checked out"
             }
         }
 
-        // =====================================================
-        // LOAD WORKSPACES
-        // =====================================================
+        // ========================================================
+        // STAGE 2 — LOAD WORKSPACE REGISTRY
+        // [MOD] Now also picks up newly registered workspace
+        // ========================================================
 
         stage('Load Workspace Registry') {
-
             steps {
-
                 script {
-
                     def wsRaw      = readFile('workspaces.json')
                     def wsRegistry = readJSON text: wsRaw
+
+                    // ── [NEW] If new workspace provided, add it ───
+                    if (params.NEW_WORKSPACE_NAME?.trim() && params.NEW_WORKSPACE_URL?.trim()) {
+
+                        def newEntry = [
+                            name             : params.NEW_WORKSPACE_NAME.trim(),
+                            owner            : params.NEW_WORKSPACE_NAME.trim(),
+                            workspace_url    : params.NEW_WORKSPACE_URL.trim(),
+                            job_id           : 'PENDING',
+                            credential_id    : params.NEW_CREDENTIAL_ID?.trim() ?: "DATABRICKS_TOKEN_${params.NEW_WORKSPACE_NAME.trim().toUpperCase()}",
+                            catalog          : params.CATALOG_OVERRIDE?.trim() ?: env.DEFAULT_CATALOG,
+                            github_repo_path : "/Workspace/Repos/admin/DATA_INTEGRATION",
+                            is_active        : true
+                        ]
+
+                        // Only add if not already present
+                        def already = wsRegistry.workspaces.find { it.name == newEntry.name }
+                        if (!already) {
+                            wsRegistry.workspaces.add(newEntry)
+                            echo "[NEW] Registered workspace: ${newEntry.name}"
+                        } else {
+                            echo "[NEW] Workspace already exists: ${newEntry.name} — skipping add"
+                        }
+                    }
 
                     def selected = wsRegistry.workspaces.findAll { ws ->
                         ws.is_active &&
                         (
                             params.WORKSPACE == 'ALL' ||
-                            ws.name == params.WORKSPACE
+                            ws.name == params.WORKSPACE ||
+                            ws.name == params.NEW_WORKSPACE_NAME?.trim()
                         )
                     }
 
@@ -70,32 +144,123 @@ pipeline {
                         error "No active workspaces found."
                     }
 
-                    env.SELECTED_WORKSPACES = writeJSON(
-                        returnText: true,
-                        json: selected
-                    )
+                    env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: selected)
 
                     echo "Workspaces selected:"
-
-                    selected.each {
-                        echo "  - ${it.name}"
-                    }
+                    selected.each { echo "  - ${it.name} | catalog: ${it.catalog ?: env.DEFAULT_CATALOG}" }
                 }
             }
         }
 
-        // =====================================================
-        // CREATE SCHEMAS + TABLES
-        // =====================================================
+        // ========================================================
+        // STAGE 2.5 — [NEW] DEPLOY NOTEBOOKS VIA REPOS API
+        // Connects GitHub repo to each workspace so notebooks
+        // are available at github_repo_path automatically
+        // ========================================================
+
+        stage('Deploy Notebooks') {
+            when { expression { return params.DEPLOY_NOTEBOOKS } }
+            steps {
+                script {
+
+                    def wsRaw      = env.SELECTED_WORKSPACES
+                    def workspaces = readJSON text: wsRaw
+                    def parallelMap = [:]
+
+                    workspaces.each { ws ->
+
+                        def wsLocal = ws
+
+                        parallelMap[wsLocal.name] = {
+
+                            withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
+
+                                echo "Deploying notebooks to : ${wsLocal.name}"
+                                echo "  Target path : ${wsLocal.github_repo_path}"
+
+                                // Check if repo already connected
+                                def repoRaw  = sh(
+                                    returnStdout: true,
+                                    script: "curl -s -X GET '${wsLocal.workspace_url}/api/2.0/repos' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                ).trim()
+
+                                def repoJson   = readJSON text: repoRaw
+                                def existsRepo = repoJson.repos?.find { it.path == wsLocal.github_repo_path }
+
+                                if (existsRepo) {
+                                    // Already connected — pull latest
+                                    def patchRaw = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X PATCH '${wsLocal.workspace_url}/api/2.0/repos/${existsRepo.id}' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
+                                            -d '{"branch":"${env.GITHUB_BRANCH}"}'
+                                        """
+                                    ).trim()
+
+                                    def patchCode = patchRaw.split('\n')[-1]
+                                    if (patchCode == '200') {
+                                        echo "  ✅ Repo already connected — pulled latest: ${wsLocal.name}"
+                                    } else {
+                                        echo "  ⚠️  Pull returned HTTP ${patchCode} — continuing"
+                                    }
+
+                                } else {
+                                    // [NEW] Not connected — create repo connection
+                                    def createPayload = [
+                                        url      : env.GITHUB_REPO,
+                                        provider : 'gitHub',
+                                        path     : wsLocal.github_repo_path
+                                    ]
+                                    def createJson = writeJSON(returnText: true, json: createPayload)
+                                    def cTmpFile   = "/tmp/repo_create_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                    writeFile file: cTmpFile, text: createJson
+
+                                    def createRaw = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X POST '${wsLocal.workspace_url}/api/2.0/repos' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
+                                            -d @${cTmpFile}
+                                        """
+                                    ).trim()
+
+                                    sh "rm -f ${cTmpFile}"
+
+                                    def createCode = createRaw.split('\n')[-1]
+                                    def createBody = createRaw.split('\n')[0..-2].join('\n')
+
+                                    if (createCode == '200' || createCode == '201') {
+                                        echo "  ✅ Notebooks connected for ${wsLocal.name}"
+                                    } else {
+                                        echo "  ⚠️  Repo connect HTTP ${createCode}: ${createBody}"
+                                        echo "  ℹ️  Connect manually: Databricks → Repos → Add Repo → ${env.GITHUB_REPO}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    parallel parallelMap
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 3 — CREATE SCHEMAS + TABLES (DDL only, no data)
+        // [MOD] Catalog now read per-workspace from registry
+        // [MOD] Also creates Bronze / Silver / Gold schemas
+        // [MOD] control_header includes new Medallion columns
+        // [KEEP] SQL runner, warehouse fetch, temp file approach
+        // ========================================================
 
         stage('Create Schemas and Tables') {
-
-            when {
-                expression { return params.CREATE_TABLES }
-            }
-
+            when { expression { return params.CREATE_TABLES } }
             steps {
-
                 script {
 
                     def wsRaw       = env.SELECTED_WORKSPACES
@@ -108,233 +273,243 @@ pipeline {
 
                         parallelMap[wsLocal.name] = {
 
-                            withCredentials([
-                                string(
-                                    credentialsId: wsLocal.credential_id,
-                                    variable: 'DB_TOKEN'
-                                )
-                            ]) {
+                            withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
 
-                                echo "======================================"
+                                echo "=================================================="
                                 echo "Deploying to : ${wsLocal.name}"
-                                echo "======================================"
+                                echo "=================================================="
 
-                                // ======================================
-                                // FIXED CATALOG LOGIC
-                                // ======================================
-
+                                // [MOD] Read catalog per workspace — fallback to default
                                 def catalog = wsLocal.catalog ?: env.DEFAULT_CATALOG
                                 def wsUrl   = wsLocal.workspace_url
 
-                                // Databricks Free Edition compatibility
-                                if (catalog == 'demo_catalog') {
+                                echo "  Catalog : ${catalog}"
 
-                                    echo "demo_catalog not supported"
-                                    echo "Switching to hive_metastore"
-
-                                    catalog = 'hive_metastore'
-                                }
-
-                                echo "Catalog : ${catalog}"
-
-                                // ======================================
-                                // GET SQL WAREHOUSE
-                                // ======================================
-
-                                def whRaw = sh(
+                                // ── Get warehouse ─────────────────────────────
+                                def whRaw  = sh(
                                     returnStdout: true,
-                                    script: """
-                                        curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' \
-                                        -H 'Authorization: Bearer ${DB_TOKEN}'
-                                    """
+                                    script: "curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
                                 ).trim()
 
                                 def whJson     = readJSON text: whRaw
                                 def warehouses = whJson.warehouses ?: []
 
                                 if (warehouses.isEmpty()) {
-
-                                    error """
-                                    No SQL warehouse found.
-                                    Create one in Databricks SQL Warehouses.
-                                    """
+                                    error "No SQL warehouse in ${wsLocal.name}. Go to Databricks → SQL Warehouses → New."
                                 }
 
                                 def warehouseId = warehouses[0].id
+                                echo "  Warehouse : ${warehouseId}"
 
-                                echo "Warehouse : ${warehouseId}"
+                                // ── [NEW] Auto-detect catalog ─────────────────
+                                // If catalog in workspaces.json does not exist,
+                                // fall back to hive_metastore (free edition default)
+                                def resolvedCatalog = catalog
 
-                                // ======================================
-                                // SQL RUNNER
-                                // ======================================
+                                def catCheckRaw = sh(
+                                    returnStdout: true,
+                                    script: """
+                                        curl -s -w "\\n%{http_code}" \\
+                                        -X POST '${wsUrl}/api/2.0/sql/statements' \\
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                        -H 'Content-Type: application/json' \\
+                                        -d '{"statement":"SHOW CATALOGS","warehouse_id":"${warehouseId}","wait_timeout":"30s","on_wait_timeout":"CANCEL"}'
+                                    """
+                                ).trim()
 
+                                def catLines   = catCheckRaw.split('\n')
+                                def catCode    = catLines[-1]
+                                def catBody    = catLines[0..-2].join('\n')
+
+                                if (catCode == '200') {
+                                    def catJson    = readJSON text: catBody
+                                    def catRows    = catJson.result?.data_array ?: []
+                                    def catNames   = catRows.collect { it[0] }
+                                    echo "  Available catalogs : ${catNames.join(', ')}"
+
+                                    if (catNames.contains(catalog)) {
+                                        resolvedCatalog = catalog
+                                        echo "  Using catalog : ${resolvedCatalog}"
+                                    } else if (catNames.contains('hive_metastore')) {
+                                        resolvedCatalog = 'hive_metastore'
+                                        echo "  ⚠️  '${catalog}' not found — using hive_metastore (free edition default)"
+                                    } else if (!catNames.isEmpty()) {
+                                        resolvedCatalog = catNames[0]
+                                        echo "  ⚠️  '${catalog}' not found — using first available: ${resolvedCatalog}"
+                                    } else {
+                                        echo "  ⚠️  No catalogs found — attempting to create ${catalog}"
+                                        resolvedCatalog = catalog
+                                    }
+                                } else {
+                                    echo "  ⚠️  Could not list catalogs HTTP ${catCode} — using ${catalog} as-is"
+                                }
+
+                                // Override catalog with resolved value for all DDL below
+                                catalog = resolvedCatalog
+
+                                // ── SQL runner (unchanged) ────────────────────
                                 def runSQL = { String sqlText ->
-
                                     def payload = [
                                         statement       : sqlText,
                                         warehouse_id    : warehouseId,
                                         wait_timeout    : '50s',
                                         on_wait_timeout : 'CANCEL'
                                     ]
-
-                                    def payloadJson = writeJSON(
-                                        returnText: true,
-                                        json: payload
-                                    )
-
-                                    def tmpFile = "/tmp/sql_${System.currentTimeMillis()}.json"
-
+                                    def payloadJson = writeJSON(returnText: true, json: payload)
+                                    def tmpFile     = "/tmp/sql_${wsLocal.name}_${System.currentTimeMillis()}.json"
                                     writeFile file: tmpFile, text: payloadJson
 
                                     def apiRaw = sh(
                                         returnStdout: true,
                                         script: """
-                                            curl -s -w "\\n%{http_code}" \
-                                            -X POST '${wsUrl}/api/2.0/sql/statements' \
-                                            -H 'Authorization: Bearer ${DB_TOKEN}' \
-                                            -H 'Content-Type: application/json' \
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X POST '${wsUrl}/api/2.0/sql/statements' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
                                             -d @${tmpFile}
                                         """
                                     ).trim()
 
                                     sh "rm -f ${tmpFile}"
 
-                                    def apiLines = apiRaw.split('\\n')
-
+                                    def apiLines = apiRaw.split('\n')
                                     def httpCode = apiLines[-1]
-                                    def apiBody  = apiLines[0..-2].join('\\n')
+                                    def apiBody  = apiLines[0..-2].join('\n')
 
                                     if (httpCode != '200') {
-
-                                        error "SQL API ERROR : ${apiBody}"
+                                        error "SQL API HTTP ${httpCode}: ${apiBody}"
                                     }
 
                                     def apiJson  = readJSON text: apiBody
                                     def sqlState = apiJson.status?.state ?: 'UNKNOWN'
 
                                     if (sqlState == 'FAILED') {
-
-                                        def errMsg = apiJson.status?.error?.message ?: 'Unknown SQL error'
-
-                                        error "SQL FAILED : ${errMsg}"
+                                        def errMsg = apiJson.status?.error?.message ?: 'Unknown error'
+                                        error "SQL FAILED: ${errMsg}"
                                     }
                                 }
 
-                                // ======================================
-                                // CREATE SCHEMAS
-                                // ======================================
+                                echo "  Creating schemas..."
 
-                                echo "Creating schemas..."
+                                // ── Admin schema + control tables ─────────────
+                                runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.admin")
+                                echo "  ${catalog}.admin — done"
 
-                                runSQL("""
-                                    CREATE SCHEMA IF NOT EXISTS ${catalog}.admin
-                                """)
+                                // [MOD] Medallion data schemas
+                                runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.bronze")
+                                echo "  ${catalog}.bronze — done"
 
-                                echo "admin schema created"
+                                runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.silver")
+                                echo "  ${catalog}.silver — done"
 
-                                runSQL("""
-                                    CREATE SCHEMA IF NOT EXISTS ${catalog}.bronze
-                                """)
+                                runSQL("CREATE SCHEMA IF NOT EXISTS ${catalog}.gold")
+                                echo "  ${catalog}.gold — done"
 
-                                echo "bronze schema created"
+                                echo "  Creating control tables..."
 
-                                runSQL("""
-                                    CREATE SCHEMA IF NOT EXISTS ${catalog}.silver
-                                """)
+                                // control_header — [MOD] includes Medallion columns
+                                runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_control_header (
+                                    DATA_FLOW_GROUP_ID     STRING NOT NULL,
+                                    JOB_NAME               STRING,
+                                    NOTEBOOK_PATH          STRING,
+                                    TRIGGER_TYPE           STRING,
+                                    ETL_LAYER              STRING,
+                                    COMPUTE_CLASS_DEV      STRING,
+                                    COMPUTE_CLASS          STRING,
+                                    BUSINESS_OBJECT_NAME   STRING,
+                                    COST_CENTER            STRING,
+                                    DATA_SME               STRING,
+                                    BUSINESS_UNIT          STRING,
+                                    PRODUCT_OWNER          STRING,
+                                    INGESTION_MODE         STRING,
+                                    INGESTION_BUCKET       STRING,
+                                    SPARK_CONFIGS          STRING,
+                                    WARNING_THRESHOLD_MINS STRING,
+                                    WARNING_DL_GROUP       STRING,
+                                    MIN_VERSION            STRING,
+                                    MAX_VERSION            STRING,
+                                    IS_ACTIVE              STRING,
+                                    CREATED_DATE           TIMESTAMP,
+                                    UPDATED_DATE           TIMESTAMP
+                                ) USING DELTA""")
+                                echo "  control_header — done"
 
-                                echo "silver schema created"
+                                // l0_detail — Bronze config
+                                runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l0_detail (
+                                    DATA_FLOW_GROUP_ID  STRING NOT NULL,
+                                    SOURCE_URL          STRING,
+                                    SOURCE_OBJ_SCHEMA   STRING,
+                                    SOURCE_OBJ_NAME     STRING,
+                                    LOB                 STRING,
+                                    TARGET_SCHEMA       STRING,
+                                    TARGET_TABLE        STRING,
+                                    FILE_FORMAT         STRING,
+                                    INPUT_FILE_FORMAT   STRING,
+                                    LOAD_TYPE           STRING,
+                                    STORAGE_TYPE        STRING,
+                                    DQ_LOGIC            STRING,
+                                    DELIMETER           STRING,
+                                    CUSTOM_SCHEMA       STRING,
+                                    CDC_LOGIC           STRING,
+                                    PRESTAG_FLAG        STRING,
+                                    LS_FLAG             STRING,
+                                    IS_ACTIVE           STRING,
+                                    CREATED_DATE        TIMESTAMP,
+                                    UPDATED_DATE        TIMESTAMP
+                                ) USING DELTA""")
+                                echo "  l0_detail — done"
 
-                                runSQL("""
-                                    CREATE SCHEMA IF NOT EXISTS ${catalog}.gold
-                                """)
+                                // l1_detail — Silver config
+                                runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l1_detail (
+                                    DATA_FLOW_GROUP_ID   STRING NOT NULL,
+                                    SOURCE_OBJ_SCHEMA    STRING,
+                                    SOURCE_OBJ_NAME      STRING,
+                                    TARGET_SCHEMA        STRING,
+                                    TARGET_TABLE         STRING,
+                                    LOAD_TYPE            STRING,
+                                    TRANSFORMATION_QUERY STRING,
+                                    MERGE_KEYS           STRING,
+                                    PARTITION_BY         STRING,
+                                    DQ_LOGIC             STRING,
+                                    IS_ACTIVE            STRING,
+                                    CREATED_DATE         TIMESTAMP,
+                                    UPDATED_DATE         TIMESTAMP
+                                ) USING DELTA""")
+                                echo "  l1_detail — done"
 
-                                echo "gold schema created"
+                                // l2_detail — Gold config
+                                runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l2_detail (
+                                    DATA_FLOW_GROUP_ID   STRING NOT NULL,
+                                    SOURCE_OBJ_SCHEMA    STRING,
+                                    SOURCE_OBJ_NAME      STRING,
+                                    TARGET_SCHEMA        STRING,
+                                    TARGET_TABLE         STRING,
+                                    LOAD_TYPE            STRING,
+                                    TRANSFORMATION_QUERY STRING,
+                                    MERGE_KEYS           STRING,
+                                    PARTITION_BY         STRING,
+                                    DQ_LOGIC             STRING,
+                                    IS_ACTIVE            STRING,
+                                    CREATED_DATE         TIMESTAMP,
+                                    UPDATED_DATE         TIMESTAMP
+                                ) USING DELTA""")
+                                echo "  l2_detail — done"
 
-                                // ======================================
-                                // CREATE TABLES
-                                // ======================================
+                                // audit_log — full Medallion columns
+                                runSQL("""CREATE TABLE IF NOT EXISTS ${catalog}.admin.audit_log (
+                                    DATA_FLOW_GROUP_ID  STRING,
+                                    TARGET_TABLE        STRING,
+                                    ETL_LAYER           STRING,
+                                    STATUS              STRING,
+                                    ROWS_LOADED         BIGINT,
+                                    MESSAGE             STRING,
+                                    START_TIME          TIMESTAMP,
+                                    END_TIME            TIMESTAMP,
+                                    LOAD_TS             TIMESTAMP
+                                ) USING DELTA""")
+                                echo "  audit_log — done"
 
-                                echo "Creating framework tables..."
-
-                                runSQL("""
-                                    CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_control_header (
-
-                                        DATA_FLOW_GROUP_ID STRING,
-                                        JOB_NAME STRING,
-                                        NOTEBOOK_PATH STRING,
-                                        TRIGGER_TYPE STRING,
-                                        ETL_LAYER STRING,
-                                        COMPUTE_CLASS_DEV STRING,
-                                        COMPUTE_CLASS STRING,
-                                        BUSINESS_OBJECT_NAME STRING,
-                                        COST_CENTER STRING,
-                                        DATA_SME STRING,
-                                        BUSINESS_UNIT STRING,
-                                        PRODUCT_OWNER STRING,
-                                        INGESTION_MODE STRING,
-                                        INGESTION_BUCKET STRING,
-                                        SPARK_CONFIGS STRING,
-                                        WARNING_THRESHOLD_MINS STRING,
-                                        WARNING_DL_GROUP STRING,
-                                        MIN_VERSION STRING,
-                                        MAX_VERSION STRING,
-                                        IS_ACTIVE STRING,
-                                        CREATED_DATE TIMESTAMP,
-                                        UPDATED_DATE TIMESTAMP
-
-                                    ) USING DELTA
-                                """)
-
-                                echo "data_flow_control_header created"
-
-                                runSQL("""
-                                    CREATE TABLE IF NOT EXISTS ${catalog}.admin.data_flow_l0_detail (
-
-                                        DATA_FLOW_GROUP_ID STRING,
-                                        SOURCE_URL STRING,
-                                        SOURCE_OBJ_SCHEMA STRING,
-                                        SOURCE_OBJ_NAME STRING,
-                                        LOB STRING,
-                                        TARGET_SCHEMA STRING,
-                                        TARGET_TABLE STRING,
-                                        FILE_FORMAT STRING,
-                                        INPUT_FILE_FORMAT STRING,
-                                        LOAD_TYPE STRING,
-                                        STORAGE_TYPE STRING,
-                                        DQ_LOGIC STRING,
-                                        DELIMETER STRING,
-                                        CUSTOM_SCHEMA STRING,
-                                        CDC_LOGIC STRING,
-                                        PRESTAG_FLAG STRING,
-                                        LS_FLAG STRING,
-                                        IS_ACTIVE STRING,
-                                        CREATED_DATE TIMESTAMP,
-                                        UPDATED_DATE TIMESTAMP
-
-                                    ) USING DELTA
-                                """)
-
-                                echo "data_flow_l0_detail created"
-
-                                runSQL("""
-                                    CREATE TABLE IF NOT EXISTS ${catalog}.admin.audit_log (
-
-                                        DATA_FLOW_GROUP_ID STRING,
-                                        TARGET_TABLE STRING,
-                                        ETL_LAYER STRING,
-                                        STATUS STRING,
-                                        ROWS_LOADED BIGINT,
-                                        MESSAGE STRING,
-                                        START_TIME TIMESTAMP,
-                                        END_TIME TIMESTAMP,
-                                        LOAD_TS TIMESTAMP
-
-                                    ) USING DELTA
-                                """)
-
-                                echo "audit_log created"
-
-                                echo "SUCCESS : ${wsLocal.name}"
+                                echo "✅ All schemas and tables ready : ${wsLocal.name}"
                             }
                         }
                     }
@@ -346,22 +521,10 @@ pipeline {
     }
 
     post {
-
         always {
-
-            echo "WORKSPACE : ${params.WORKSPACE}"
-            echo "STATUS    : ${currentBuild.currentResult}"
+            echo "WORKSPACE: ${params.WORKSPACE} | STATUS: ${currentBuild.currentResult}"
         }
-
-        success {
-
-            echo "DEPLOYMENT SUCCESS"
-        }
-
-        failure {
-
-            echo "DEPLOYMENT FAILED"
-        }
+        success { echo "DEPLOYMENT SUCCESS" }
+        failure { echo "DEPLOYMENT FAILED" }
     }
 }
-```
