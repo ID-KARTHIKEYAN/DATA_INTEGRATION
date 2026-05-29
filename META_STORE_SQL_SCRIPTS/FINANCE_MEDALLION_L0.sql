@@ -1,7 +1,7 @@
 -- ==============================================
--- Workspace : MARAN_workspace
+-- Workspace : karthik_workspace
 -- Group     : FINANCE_MEDALLION_L0
--- Generated : 2026-05-29 11:18:22
+-- Generated : 2026-05-29 11:19:30
 -- ==============================================
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
@@ -9,7 +9,7 @@ USING (
   SELECT
     'FINANCE_MEDALLION_L0'           AS DATA_FLOW_GROUP_ID,
     'FINANCE_MEDALLION_L0_JOB'       AS JOB_NAME,
-    '/Workspace/Repos/ma34884730@gmail.com/DATA_INTEGRATION/notebooks/run_framework'      AS NOTEBOOK_PATH,
+    '/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework'      AS NOTEBOOK_PATH,
     'Y'                    AS IS_ACTIVE,
     current_timestamp()    AS CREATED_DATE,
     current_timestamp()    AS UPDATED_DATE
