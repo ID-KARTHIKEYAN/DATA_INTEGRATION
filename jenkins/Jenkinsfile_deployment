@@ -14,6 +14,15 @@
 //   [MOD] CREATE TABLE now creates Bronze / Silver / Gold schemas too
 //   [KEEP] All existing stages, structure, SQL runner unchanged
 // ============================================================
+// FIXES:
+//   [FIX] Catalog fallback now uses hive_metastore (not demo_catalog)
+//         when CATALOG_OVERRIDE is blank and catalog check HTTP != 200
+//   [FIX] DEFAULT_CATALOG changed from 'demo_catalog' to 'hive_metastore'
+//         so free/community Databricks workspaces work out of the box
+//   [FIX] SHOW CATALOGS failure no longer silently proceeds with a
+//         non-existent catalog — it now falls back to hive_metastore
+//   [FIX] CATALOG_OVERRIDE description updated to reflect new default
+// ============================================================
 
 pipeline {
 
@@ -51,7 +60,8 @@ pipeline {
         string(
             name: 'CATALOG_OVERRIDE',
             defaultValue: '',
-            description: '[NEW] Override catalog for new workspace. Leave blank to use demo_catalog'
+            // [FIX] Updated description — default is now hive_metastore, not demo_catalog
+            description: '[NEW] Override catalog for new workspace. Leave blank to use hive_metastore (auto-detected)'
         )
 
         // ── Existing parameter ────────────────────────────────
@@ -76,7 +86,10 @@ pipeline {
         GITHUB_API           = 'https://api.github.com'
         GITHUB_OWNER         = 'ID-KARTHIKEYAN'
         GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
-        DEFAULT_CATALOG      = 'demo_catalog'
+        // [FIX] Changed from 'demo_catalog' to 'hive_metastore'
+        //       hive_metastore exists in ALL Databricks workspaces by default.
+        //       Unity Catalog users: set CATALOG_OVERRIDE or update workspaces.json per workspace.
+        DEFAULT_CATALOG      = 'hive_metastore'
     }
 
     stages {
@@ -116,6 +129,7 @@ pipeline {
                             workspace_url    : params.NEW_WORKSPACE_URL.trim(),
                             job_id           : 'PENDING',
                             credential_id    : params.NEW_CREDENTIAL_ID?.trim() ?: "DATABRICKS_TOKEN_${params.NEW_WORKSPACE_NAME.trim().toUpperCase()}",
+                            // [FIX] Fallback to DEFAULT_CATALOG (hive_metastore) not demo_catalog
                             catalog          : params.CATALOG_OVERRIDE?.trim() ?: env.DEFAULT_CATALOG,
                             github_repo_path : "/Workspace/Repos/admin/DATA_INTEGRATION",
                             is_active        : true
@@ -283,7 +297,7 @@ pipeline {
                                 def catalog = wsLocal.catalog ?: env.DEFAULT_CATALOG
                                 def wsUrl   = wsLocal.workspace_url
 
-                                echo "  Catalog : ${catalog}"
+                                echo "  Configured catalog : ${catalog}"
 
                                 // ── Get warehouse ─────────────────────────────
                                 def whRaw  = sh(
@@ -301,9 +315,10 @@ pipeline {
                                 def warehouseId = warehouses[0].id
                                 echo "  Warehouse : ${warehouseId}"
 
-                                // ── [NEW] Auto-detect catalog ─────────────────
-                                // If catalog in workspaces.json does not exist,
-                                // fall back to hive_metastore (free edition default)
+                                // ── Auto-detect catalog ───────────────────────
+                                // Run SHOW CATALOGS and resolve the best available
+                                // catalog. Falls back safely to hive_metastore so
+                                // the pipeline never fires DDL against a missing catalog.
                                 def resolvedCatalog = catalog
 
                                 def catCheckRaw = sh(
@@ -317,37 +332,54 @@ pipeline {
                                     """
                                 ).trim()
 
-                                def catLines   = catCheckRaw.split('\n')
-                                def catCode    = catLines[-1]
-                                def catBody    = catLines[0..-2].join('\n')
+                                def catLines = catCheckRaw.split('\n')
+                                def catCode  = catLines[-1]
+                                def catBody  = catLines[0..-2].join('\n')
 
                                 if (catCode == '200') {
-                                    def catJson    = readJSON text: catBody
-                                    def catRows    = catJson.result?.data_array ?: []
-                                    def catNames   = catRows.collect { it[0] }
+                                    def catJson  = readJSON text: catBody
+                                    def catRows  = catJson.result?.data_array ?: []
+                                    def catNames = catRows.collect { it[0] }
                                     echo "  Available catalogs : ${catNames.join(', ')}"
 
                                     if (catNames.contains(catalog)) {
                                         resolvedCatalog = catalog
-                                        echo "  Using catalog : ${resolvedCatalog}"
+                                        echo "  ✅ Using catalog : ${resolvedCatalog}"
                                     } else if (catNames.contains('hive_metastore')) {
+                                        // [FIX] Explicit safe fallback for free/community edition
                                         resolvedCatalog = 'hive_metastore'
-                                        echo "  ⚠️  '${catalog}' not found — using hive_metastore (free edition default)"
+                                        echo "  ⚠️  '${catalog}' not found — falling back to hive_metastore"
                                     } else if (!catNames.isEmpty()) {
                                         resolvedCatalog = catNames[0]
                                         echo "  ⚠️  '${catalog}' not found — using first available: ${resolvedCatalog}"
                                     } else {
-                                        echo "  ⚠️  No catalogs found — attempting to create ${catalog}"
-                                        resolvedCatalog = catalog
+                                        // [FIX] No catalogs listed at all — hard fail with clear message
+                                        //       instead of blindly proceeding with a missing catalog name
+                                        error "No catalogs returned for workspace '${wsLocal.name}'. " +
+                                              "Ensure the service principal has USE CATALOG privilege or " +
+                                              "set an explicit catalog in workspaces.json."
                                     }
                                 } else {
-                                    echo "  ⚠️  Could not list catalogs HTTP ${catCode} — using ${catalog} as-is"
+                                    // [FIX] SHOW CATALOGS call itself failed (auth error, network, etc.)
+                                    //       Previously this silently continued with the original (broken) catalog.
+                                    //       Now we fall back to hive_metastore and log a clear warning so the
+                                    //       operator knows to investigate.
+                                    echo "  ⚠️  SHOW CATALOGS returned HTTP ${catCode} — response: ${catBody}"
+                                    if (catalog == env.DEFAULT_CATALOG || catalog == 'demo_catalog') {
+                                        resolvedCatalog = 'hive_metastore'
+                                        echo "  ⚠️  Defaulting to hive_metastore (catalog check failed and no explicit catalog set)"
+                                    } else {
+                                        // User explicitly set a catalog — trust it but warn loudly
+                                        resolvedCatalog = catalog
+                                        echo "  ⚠️  Proceeding with explicitly configured catalog '${catalog}' despite check failure"
+                                    }
                                 }
 
                                 // Override catalog with resolved value for all DDL below
                                 catalog = resolvedCatalog
+                                echo "  Final catalog for DDL : ${catalog}"
 
-                                // ── SQL runner (unchanged) ────────────────────
+                                // ── SQL runner ────────────────────────────────
                                 def runSQL = { String sqlText ->
                                     def payload = [
                                         statement       : sqlText,
