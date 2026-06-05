@@ -1,7 +1,7 @@
 -- ==============================================
 -- Workspace : MARAN_workspace
 -- Group     : EMPLOYEE_MASTER_L0
--- Generated : 2026-06-05 11:42:52
+-- Generated : 2026-06-05 12:01:55
 -- ==============================================
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
