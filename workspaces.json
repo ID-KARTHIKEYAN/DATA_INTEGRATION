@@ -35,7 +35,7 @@
       "owner": "RAJA",
       "workspace_url": "https://dbc-c1194db2-3f99.cloud.databricks.com",
       "job_id": "2514585521553695",
-      "credential_id": "ADMIN_TEST_TOKEN",
+      "credential_id": "RAJA_TOKEN",
       "catalog": "demo_catalog",
       "github_repo_path": "/Workspace/Repos/chennaigusts@gmail.com/DATA_INTEGRATION",
       "is_active": true
