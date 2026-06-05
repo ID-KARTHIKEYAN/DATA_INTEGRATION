@@ -12,7 +12,7 @@ pipeline {
 
         choice(
             name: 'WORKSPACE',
-            choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace'],
+            choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace','RAJA_2005'],
             description: 'Select target workspace'
         )
 
