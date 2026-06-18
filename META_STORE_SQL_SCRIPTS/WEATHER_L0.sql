@@ -1,7 +1,7 @@
 -- ==============================================
 -- Workspace : karthik_workspace
 -- Group     : WEATHER_L0
--- Generated : 2026-06-18 05:12:47
+-- Generated : 2026-06-18 05:17:04
 -- ==============================================
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
