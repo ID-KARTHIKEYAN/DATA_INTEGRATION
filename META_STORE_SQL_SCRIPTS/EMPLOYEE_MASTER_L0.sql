@@ -1,7 +1,7 @@
 -- ==============================================
--- Workspace : RAJA_2005
+-- Workspace : karthik_workspace
 -- Group     : EMPLOYEE_MASTER_L0
--- Generated : 2026-06-18 13:30:04
+-- Generated : 2026-06-18 17:28:32
 -- ==============================================
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
@@ -9,7 +9,7 @@ USING (
   SELECT
     'EMPLOYEE_MASTER_L0'           AS DATA_FLOW_GROUP_ID,
     'EMPLOYEE_MASTER_L0_JOB'       AS JOB_NAME,
-    '/Workspace/Users/athangashanmugaraja@gmail.com/DATA_INTEGRATION/notebooks/run_framework'      AS NOTEBOOK_PATH,
+    '/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework'      AS NOTEBOOK_PATH,
     'Y'                    AS IS_ACTIVE,
     current_timestamp()    AS CREATED_DATE,
     current_timestamp()    AS UPDATED_DATE
