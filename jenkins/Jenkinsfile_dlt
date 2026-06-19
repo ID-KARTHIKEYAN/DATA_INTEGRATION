@@ -153,7 +153,7 @@ pipeline {
                                 def wsUrl        = wsLocal.workspace_url
                                 def catalog      = wsLocal.catalog ?: 'demo_catalog'
                                 def repoPath     = wsLocal.github_repo_path
-                                def notebookPath = "${repoPath}/notebooks/dlt_pipeline"
+                                def notebookPath = "${repoPath}/notebooks/run_framework"
                                 def pipelineName = "${params.GROUP_ID}_DLT"
 
                                 // ── Check if DLT pipeline exists ──────────────
