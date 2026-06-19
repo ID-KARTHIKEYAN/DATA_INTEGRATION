@@ -184,34 +184,24 @@ pipeline {
                                     // Create new DLT pipeline
                                     echo "  Creating DLT pipeline: ${pipelineName}"
 
+                                    // No clusters block — free edition requires serverless
+                                    // Serverless is assigned automatically when clusters omitted
                                     def dltPayload = [
-                                        name        : pipelineName,
-                                        channel     : params.DLT_CHANNEL,
-                                        continuous  : params.DLT_MODE == 'continuous',
-                                        development : params.DEVELOPMENT_MODE,
-                                        catalog     : catalog,
-                                        target      : 'bronze',
+                                        name          : pipelineName,
+                                        channel       : params.DLT_CHANNEL,
+                                        continuous    : params.DLT_MODE == 'continuous',
+                                        development   : params.DEVELOPMENT_MODE,
+                                        serverless    : true,
+                                        catalog       : catalog,
+                                        target        : 'bronze',
                                         configuration : [
                                             'pipeline.catalog'  : catalog,
                                             'pipeline.group_id' : params.GROUP_ID
                                         ],
-                                        libraries   : [
+                                        libraries     : [
                                             [
                                                 notebook : [
                                                     path : notebookPath
-                                                ]
-                                            ]
-                                        ],
-                                        clusters    : [
-                                            [
-                                                label    : 'default',
-                                                num_workers : 0,
-                                                spark_conf  : [
-                                                    'spark.master'                          : 'local[*, 4]',
-                                                    'spark.databricks.cluster.profile'      : 'singleNode'
-                                                ],
-                                                custom_tags : [
-                                                    'ResourceClass' : 'SingleNode'
                                                 ]
                                             ]
                                         ]
