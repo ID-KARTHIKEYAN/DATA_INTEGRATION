@@ -170,9 +170,19 @@ pipeline {
                                 def pipelineId = ''
 
                                 if (existingPipe && params.RECREATE_PIPELINE) {
-                                    // Delete and recreate
                                     sh "curl -s -X DELETE '${wsUrl}/api/2.0/pipelines/${existingPipe.pipeline_id}' -H 'Authorization: Bearer ${DB_TOKEN}'"
-                                    echo "  Deleted existing DLT pipeline: ${existingPipe.pipeline_id}"
+                                    echo "  Deleted DLT pipeline: ${existingPipe.pipeline_id}"
+
+                                    // Delete old job too — it has stale pipeline_id
+                                    def oldJobName  = "${pipelineName}_JOB"
+                                    def oldJobsRaw  = sh(returnStdout: true, script: "curl -s '${wsUrl}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                                    def oldJobsJson = readJSON text: oldJobsRaw
+                                    def oldJob      = oldJobsJson.jobs?.find { j -> j.settings?.name == oldJobName }
+                                    if (oldJob) {
+                                        sh "curl -s -X POST '${wsUrl}/api/2.1/jobs/delete' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d '{\"job_id\":${oldJob.job_id}}'"
+                                        echo "  Deleted stale job: ${oldJob.job_id}"
+                                    }
+
                                     existingPipe = null
                                 }
 
@@ -301,7 +311,28 @@ pipeline {
                                     echo "  ✅ Job created — job_id: ${jobId}"
                                 }
 
-                                // Store pipeline_id and job_id for next stage
+                                // Always reset job → current pipelineId (fixes stale reference)
+                                def syncPayload = writeJSON(returnText: true, json: [
+                                    job_id       : jobId,
+                                    new_settings : [
+                                        name  : jobName,
+                                        max_concurrent_runs : 1,
+                                        tasks : [[
+                                            task_key      : "${params.GROUP_ID}_dlt_task",
+                                            pipeline_task : [
+                                                pipeline_id  : pipelineId,
+                                                full_refresh : false
+                                            ]
+                                        ]]
+                                    ]
+                                ])
+                                def syncFile = "/tmp/sync_${wsLocal.name}.json"
+                                writeFile file: syncFile, text: syncPayload
+                                sh "curl -s -X POST '${wsUrl}/api/2.1/jobs/reset' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${syncFile}"
+                                sh "rm -f ${syncFile}"
+                                echo "  ✅ Job reset → pipeline_id: ${pipelineId}"
+
+                                // Store for next stage
                                 pipelineIds[wsLocal.name] = [
                                     pipeline_id   : pipelineId,
                                     job_id        : jobId,
