@@ -95,24 +95,63 @@ print(f"Found {len(existing_jobs)} existing job(s).")
 # COMMAND ----------
 # ── Step 3: Create missing jobs ───────────────────────────────
 
+def group_has_view_load(grp_id):
+    """Check l1_detail / l2_detail for any active LOAD_TYPE='VIEW' row for this GROUP_ID."""
+    for layer_table in ("data_flow_l1_detail", "data_flow_l2_detail"):
+        try:
+            cnt = spark.sql(f"""
+                SELECT COUNT(*) AS c
+                FROM demo_catalog.admin.{layer_table}
+                WHERE DATA_FLOW_GROUP_ID = '{grp_id}'
+                  AND IS_ACTIVE = 'Y'
+                  AND UPPER(LOAD_TYPE) = 'VIEW'
+            """).collect()[0]["c"]
+            if cnt > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+# Path to the dedicated view-creation notebook
+VIEW_PIPELINE_NOTEBOOK_PATH = "/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/create_view_pipeline"
+
 def build_payload(grp_id, notebook_path):
+    has_view = group_has_view_load(grp_id)
+
+    tasks = [
+        {
+            "task_key": f"{grp_id}_task",
+            "notebook_task": {
+                "notebook_path": notebook_path,
+                "base_parameters": {"GROUP_ID": grp_id},
+                "source": "WORKSPACE"
+            },
+            "environment_key": "default_env"
+        }
+    ]
+
+    # [NEW] If this GROUP_ID has any LOAD_TYPE='VIEW' row in l1/l2 detail,
+    # chain a second task that runs create_view_pipeline.py right after
+    # the main load, so views are (re)created from the latest data.
+    if has_view:
+        tasks.append({
+            "task_key": f"{grp_id}_create_view_task",
+            "depends_on": [{"task_key": f"{grp_id}_task"}],
+            "notebook_task": {
+                "notebook_path": VIEW_PIPELINE_NOTEBOOK_PATH,
+                "base_parameters": {"GROUP_ID": grp_id, "RUN_LAYER": "L1"},
+                "source": "WORKSPACE"
+            },
+            "environment_key": "default_env"
+        })
+
     return {
         "name": grp_id,
         "max_concurrent_runs": 1,
         "parameters": [
             {"name": "GROUP_ID", "default": grp_id}
         ],
-        "tasks": [
-            {
-                "task_key": f"{grp_id}_task",
-                "notebook_task": {
-                    "notebook_path": notebook_path,
-                    "base_parameters": {"GROUP_ID": grp_id},
-                    "source": "WORKSPACE"
-                },
-                "environment_key": "default_env"
-            }
-        ],
+        "tasks": tasks,
         "environments": [
             {
                 "environment_key": "default_env",
