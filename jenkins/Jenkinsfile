@@ -651,6 +651,261 @@ pipeline {
         }
     }
 
+
+        // ========================================================
+        // STAGE 8 — TRIGGER VIEW PIPELINE (auto, after job done)
+        // ========================================================
+        // Runs ONLY if the main job succeeded.
+        // For each workspace, checks data_flow_l1_detail AND
+        // data_flow_l2_detail for any rows with LOAD_TYPE = 'VIEW'
+        // for this GROUP_ID.
+        // If found → creates/finds the view_pipeline job and triggers it.
+        // No NOTEBOOK_PATH change needed in control_header —
+        // run_framework handles all TABLE/MERGE/APPEND layers,
+        // view_pipeline handles only VIEW rows, triggered here.
+        // ========================================================
+
+        stage('Trigger View Pipeline') {
+            when {
+                expression {
+                    // Only run if main pipeline succeeded and WAIT_FOR_COMPLETION was true
+                    return params.WAIT_FOR_COMPLETION &&
+                           currentBuild.currentResult == 'SUCCESS'
+                }
+            }
+            steps {
+                script {
+
+                    def wsRaw      = env.SELECTED_WORKSPACES
+                    def workspaces = readJSON text: wsRaw
+                    def groupId    = params.GROUP_ID.trim().toUpperCase()
+                    def parallelMap = [:]
+
+                    workspaces.each { ws ->
+
+                        def wsLocal = ws
+
+                        parallelMap[wsLocal.name] = {
+
+                            withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
+
+                                def catalog     = wsLocal.catalog ?: 'demo_catalog'
+                                def wsUrl       = wsLocal.workspace_url
+
+                                // ── Get warehouse ─────────────────────────────
+                                def whRaw  = sh(
+                                    returnStdout: true,
+                                    script: "curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                ).trim()
+
+                                def whJson     = readJSON text: whRaw
+                                def warehouses = whJson.warehouses ?: []
+
+                                if (warehouses.isEmpty()) {
+                                    echo "  ⚠️  No warehouse in ${wsLocal.name} — skipping view check"
+                                    return
+                                }
+
+                                def warehouseId = warehouses[0].id
+
+                                // ── Query helper ──────────────────────────────
+                                def querySQL = { String sqlText ->
+                                    def payload = [
+                                        statement       : sqlText,
+                                        warehouse_id    : warehouseId,
+                                        wait_timeout    : '50s',
+                                        on_wait_timeout : 'CANCEL'
+                                    ]
+                                    def pJson   = writeJSON(returnText: true, json: payload)
+                                    def tmpFile = "/tmp/vq_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                    writeFile file: tmpFile, text: pJson
+
+                                    def qRaw = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X POST '${wsUrl}/api/2.0/sql/statements' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
+                                            -d @${tmpFile}
+                                        """
+                                    ).trim()
+
+                                    sh "rm -f ${tmpFile}"
+
+                                    def qLines = qRaw.split('\n')
+                                    def qCode  = qLines[-1]
+                                    def qBody  = qLines[0..-2].join('\n')
+
+                                    if (qCode != '200') { return [] }
+
+                                    def qJson = readJSON text: qBody
+                                    if (qJson.status?.state == 'FAILED') { return [] }
+
+                                    return qJson.result?.data_array ?: []
+                                }
+
+                                // ── Check L1 and L2 for VIEW rows ────────────
+                                def l1Views = querySQL(
+                                    "SELECT COUNT(*) FROM ${catalog}.admin.data_flow_l1_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y' AND UPPER(LOAD_TYPE) = 'VIEW'"
+                                )
+                                def l2Views = querySQL(
+                                    "SELECT COUNT(*) FROM ${catalog}.admin.data_flow_l2_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y' AND UPPER(LOAD_TYPE) = 'VIEW'"
+                                )
+
+                                def l1Count = l1Views ? (l1Views[0][0] as int) : 0
+                                def l2Count = l2Views ? (l2Views[0][0] as int) : 0
+                                def totalViews = l1Count + l2Count
+
+                                echo "  View rows found : L1=${l1Count} | L2=${l2Count} | Total=${totalViews}"
+
+                                if (totalViews == 0) {
+                                    echo "  ℹ️  No VIEW rows for ${groupId} in ${wsLocal.name} — skipping view pipeline"
+                                    return
+                                }
+
+                                echo "  VIEW rows detected — triggering view_pipeline job..."
+
+                                // ── Auto-detect run layer for view job ────────
+                                def viewLayer = 'ALL'
+                                if      (l1Count > 0 && l2Count == 0) viewLayer = 'L1'
+                                else if (l2Count > 0 && l1Count == 0) viewLayer = 'L2'
+
+                                def viewJobName = "${groupId}_VIEW"
+                                def notebookPath = "${wsLocal.github_repo_path}/notebooks/view_pipeline"
+
+                                // ── Find or create view_pipeline job ─────────
+                                def listRaw  = sh(
+                                    returnStdout: true,
+                                    script: "curl -s -X GET '${wsUrl}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                ).trim()
+
+                                def listJson    = readJSON text: listRaw
+                                def existingJob = listJson.jobs?.find { j ->
+                                    j.settings?.name == viewJobName
+                                }
+
+                                def viewJobId
+
+                                if (existingJob) {
+                                    viewJobId = existingJob.job_id
+                                    echo "  View job exists — job_id: ${viewJobId}"
+
+                                } else {
+                                    // Create view pipeline job pointing to view_pipeline.py
+                                    // source: WORKSPACE reads live from GitHub repo
+                                    def jobPayload = [
+                                        name               : viewJobName,
+                                        description        : "Auto-triggered VIEW pipeline for ${groupId} | reads view_pipeline.py from GitHub repo",
+                                        max_concurrent_runs: 1,
+                                        parameters: [
+                                            [name: 'GROUP_ID',  default: groupId],
+                                            [name: 'RUN_LAYER', default: viewLayer]
+                                        ],
+                                        tasks: [[
+                                            task_key     : "${viewJobName}_task",
+                                            notebook_task: [
+                                                notebook_path  : notebookPath,
+                                                base_parameters: [
+                                                    GROUP_ID : groupId,
+                                                    RUN_LAYER: viewLayer
+                                                ],
+                                                source: 'WORKSPACE'
+                                            ]
+                                        ]]
+                                    ]
+
+                                    def jobJson  = writeJSON(returnText: true, json: jobPayload)
+                                    def tmpFile  = "/tmp/vjob_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                    writeFile file: tmpFile, text: jobJson
+
+                                    def createRaw = sh(
+                                        returnStdout: true,
+                                        script: """
+                                            curl -s -w "\\n%{http_code}" \\
+                                            -X POST '${wsUrl}/api/2.1/jobs/create' \\
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H 'Content-Type: application/json' \\
+                                            -d @${tmpFile}
+                                        """
+                                    ).trim()
+
+                                    sh "rm -f ${tmpFile}"
+
+                                    def createLines = createRaw.split('\n')
+                                    def createCode  = createLines[-1]
+                                    def createBody  = createLines[0..-2].join('\n')
+
+                                    if (createCode != '200') {
+                                        error "View job create failed HTTP ${createCode}: ${createBody}"
+                                    }
+
+                                    def createJson = readJSON text: createBody
+                                    viewJobId = createJson.job_id
+                                    echo "  ✅ View job created — job_id: ${viewJobId}"
+                                    echo "     Notebook : ${notebookPath}"
+                                    echo "     Source   : WORKSPACE (live from GitHub)"
+                                }
+
+                                // ── Trigger the view pipeline job ─────────────
+                                def trigPayload = [
+                                    job_id        : viewJobId,
+                                    job_parameters: [
+                                        GROUP_ID : groupId,
+                                        RUN_LAYER: viewLayer
+                                    ]
+                                ]
+
+                                def trigJson    = writeJSON(returnText: true, json: trigPayload)
+                                def trigTmpFile = "/tmp/vtrig_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                writeFile file: trigTmpFile, text: trigJson
+
+                                def trigRaw = sh(
+                                    returnStdout: true,
+                                    script: """
+                                        curl -s -w "\\n%{http_code}" \\
+                                        -X POST '${wsUrl}/api/2.1/jobs/run-now' \\
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                        -H 'Content-Type: application/json' \\
+                                        -d @${trigTmpFile}
+                                    """
+                                ).trim()
+
+                                sh "rm -f ${trigTmpFile}"
+
+                                def trigLines = trigRaw.split('\n')
+                                def trigCode  = trigLines[-1]
+                                def trigBody  = trigLines[0..-2].join('\n')
+
+                                if (trigCode != '200') {
+                                    error "View pipeline trigger failed HTTP ${trigCode}: ${trigBody}"
+                                }
+
+                                def trigJson2  = readJSON text: trigBody
+                                def viewRunId  = trigJson2.run_id
+
+                                echo ""
+                                echo "  ┌─ VIEW PIPELINE TRIGGERED ──────────────────"
+                                echo "  │  Job Name   : ${viewJobName}"
+                                echo "  │  Job ID     : ${viewJobId}"
+                                echo "  │  Run ID     : ${viewRunId}"
+                                echo "  │  GROUP_ID   : ${groupId}"
+                                echo "  │  RUN_LAYER  : ${viewLayer}"
+                                echo "  │  Workspace  : ${wsLocal.name}"
+                                echo "  │  Notebook   : ${notebookPath}"
+                                echo "  │  L1 views   : ${l1Count}"
+                                echo "  │  L2 views   : ${l2Count}"
+                                echo "  └────────────────────────────────────────────"
+                                echo "  Check in Databricks → Workflows → ${viewJobName}"
+                            }
+                        }
+                    }
+
+                    parallel parallelMap
+                }
+            }
+        }
+
     post {
         always {
             echo "======================================================"
