@@ -790,12 +790,14 @@ pipeline {
                                     // ── Create DLT Pipeline (not a Job) ──────────
                                     // Uses /api/2.0/pipelines endpoint
                                     // notebook source = view_pipeline.py from GitHub Repo
+                                    // serverless = true required for free edition
+                                    // No clusters block — serverless assigns compute automatically
                                     def dltPayload = [
-                                        name        : dltName,
-                                        development : true,
-                                        continuous  : false,
-                                        channel     : 'CURRENT',
-                                        libraries   : [[
+                                        name       : dltName,
+                                        serverless : true,
+                                        continuous : false,
+                                        channel    : 'CURRENT',
+                                        libraries  : [[
                                             notebook: [
                                                 path: notebookPath
                                             ]
@@ -803,11 +805,7 @@ pipeline {
                                         configuration: [
                                             GROUP_ID : groupId,
                                             RUN_LAYER: viewLayer
-                                        ],
-                                        clusters: [[
-                                            label       : 'default',
-                                            num_workers : 0
-                                        ]]
+                                        ]
                                     ]
 
                                     def dltJson    = writeJSON(returnText: true, json: dltPayload)
