@@ -666,8 +666,9 @@ pipeline {
         stage('Trigger View Pipeline') {
             when {
                 expression {
-                    return params.WAIT_FOR_COMPLETION &&
-                           currentBuild.currentResult == 'SUCCESS'
+                    // Trigger DLT independently — does not wait for DLT to finish
+                    // Just fires and continues
+                    return currentBuild.currentResult == 'SUCCESS'
                 }
             }
             steps {
@@ -790,13 +791,14 @@ pipeline {
                                     // ── Create DLT Pipeline (not a Job) ──────────
                                     // Uses /api/2.0/pipelines endpoint
                                     // notebook source = view_pipeline.py from GitHub Repo
-                                    // serverless = true required for free edition
-                                    // No clusters block — serverless assigns compute automatically
+                                    // serverless requires catalog for Unity Catalog
                                     def dltPayload = [
                                         name       : dltName,
                                         serverless : true,
                                         continuous : false,
                                         channel    : 'CURRENT',
+                                        catalog    : catalog,
+                                        target     : 'gold',
                                         libraries  : [[
                                             notebook: [
                                                 path: notebookPath
