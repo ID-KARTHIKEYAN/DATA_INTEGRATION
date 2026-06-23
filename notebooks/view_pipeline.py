@@ -3,25 +3,20 @@
 # PIPELINE CODE — view_pipeline.py
 # Delta Live Tables (DLT) pipeline notebook.
 # =============================================================
-# FIXES in this version:
-#   [FIX 1] Anchor table goes to demo_catalog.admin schema
-#            (was going to gold — caused wrong location)
-#   [FIX 2] Anchor uses @dlt.table with target_schema=admin
-#            to avoid "already managed by pipeline" conflict
-#   [FIX 3] Business views use CREATE OR REPLACE VIEW via
-#            spark.sql() INSIDE the @dlt.table function
-#            so they land in the correct target schema (gold/silver)
-#            DLT @dlt.view puts output in pipeline target schema
-#            which is wrong — spark.sql() gives us full control
+# DESIGN:
+#   - No anchor table, no run_log table whatsoever.
+#   - DLT requires >=1 table → we use CREATE MATERIALIZED VIEW
+#     for the FIRST view row (satisfies DLT requirement).
+#   - Remaining view rows → CREATE OR REPLACE VIEW via spark.sql()
+#     so they land in the exact TARGET_SCHEMA from control table.
+#   - No view_pipeline_run_log anywhere.
 # =============================================================
 
-import dlt
-import re
+import dlt, re
 from pyspark.sql import functions as F
-from datetime import datetime
 
 # COMMAND ----------
-# ── Parameters (DLT reads from pipeline Configuration tab) ────
+# ── Parameters ────────────────────────────────────────────────
 
 def get_conf(key, default=""):
     for prefix in (f"pipelines.{key}", key):
@@ -40,7 +35,7 @@ if not GROUP_ID:
     raise Exception(
         "GROUP_ID is empty.\n"
         "Fix: DLT pipeline → Settings → Configuration tab\n"
-        "     Key=GROUP_ID   Value=FINANCE_MEDALLION_L2"
+        "     Key = GROUP_ID   Value = FINANCE_MEDALLION_L2"
     )
 
 if RUN_LAYER == "ALL":
@@ -69,7 +64,7 @@ print(f"CATALOG   : {CATALOG}")
 # ── Helpers ───────────────────────────────────────────────────
 
 def extract_select(query, view_name):
-    """Strip CREATE OR REPLACE VIEW ... AS prefix if present."""
+    """Strip CREATE OR REPLACE VIEW ... AS prefix if present, return pure SELECT."""
     q = query.strip()
     pattern = re.compile(
         r'^\s*CREATE\s+OR\s+REPLACE\s+VIEW\s+[\w.`]+\s+AS\s*',
@@ -78,14 +73,14 @@ def extract_select(query, view_name):
     q = pattern.sub('', q).strip()
     if not q.upper().startswith("SELECT"):
         raise ValueError(
-            f"TRANSFORMATION_QUERY for '{view_name}' must start with SELECT.\n"
+            f"TRANSFORMATION_QUERY for '{view_name}' must be a SELECT.\n"
             f"Got: {q[:150]}"
         )
     return q
 
 
 def resolve_refs(query, src_schema, src_table):
-    """Prefix catalog to bare schema.table references."""
+    """Prefix catalog to bare schema.table references in query."""
     q = query
     if src_schema and f"{src_schema}." in q and f"{CATALOG}.{src_schema}." not in q:
         q = q.replace(f"{src_schema}.", f"{CATALOG}.{src_schema}.")
@@ -99,7 +94,6 @@ def resolve_refs(query, src_schema, src_table):
 
 
 def load_view_rows(detail_table, layer):
-    """Return VIEW rows for this GROUP_ID from a detail table."""
     try:
         rows = spark.sql(f"""
             SELECT SOURCE_OBJ_SCHEMA, SOURCE_OBJ_NAME,
@@ -109,54 +103,82 @@ def load_view_rows(detail_table, layer):
             WHERE  DATA_FLOW_GROUP_ID = '{GROUP_ID}'
             AND    IS_ACTIVE           = 'Y'
             AND    UPPER(LOAD_TYPE)    = 'VIEW'
+            ORDER BY TARGET_TABLE
         """).collect()
-        print(f"  {layer} VIEW rows found : {len(rows)}")
+        print(f"  {layer} VIEW rows : {len(rows)}")
         return rows
     except Exception as e:
         print(f"  ⚠️  Cannot read {detail_table}: {e}")
         return []
 
 
-# Load VIEW rows at module level (DLT needs them at definition time)
+# Load all VIEW rows at definition time
 l1_rows = load_view_rows("data_flow_l1_detail", "L1") if RUN_LAYER in ("ALL","L1") else []
 l2_rows = load_view_rows("data_flow_l2_detail", "L2") if RUN_LAYER in ("ALL","L2") else []
-all_view_rows = l1_rows + l2_rows
+all_rows = l1_rows + l2_rows
 
-print(f"Total VIEW rows : {len(all_view_rows)}")
+if not all_rows:
+    raise Exception(
+        f"No VIEW rows found for GROUP_ID='{GROUP_ID}'.\n"
+        f"Check data_flow_l1_detail / data_flow_l2_detail:\n"
+        f"  IS_ACTIVE = 'Y' AND LOAD_TYPE = 'VIEW'"
+    )
+
+print(f"Total VIEW rows : {len(all_rows)}")
 
 # COMMAND ----------
 # ══════════════════════════════════════════════════════════
-# ANCHOR TABLE — satisfies DLT's ≥1 table requirement
-# [FIX 1] Stored in admin schema, NOT gold/silver
-# [FIX 2] pipeline_id in name makes it unique per pipeline
-#          → avoids "already managed by pipeline" error
+# DLT requires >=1 @dlt.table or MATERIALIZED VIEW.
+#
+# Strategy:
+#   Row[0]  → registered as @dlt.table (MATERIALIZED VIEW)
+#              This satisfies DLT's table requirement.
+#              It also physically creates the view content
+#              as a materialized table in the target schema.
+#   Row[1+] → created via spark.sql(CREATE OR REPLACE VIEW)
+#              inside Row[0]'s function, so they all land
+#              in the correct TARGET_SCHEMA from control table.
+#
+# No run_log, no anchor, no dummy table of any kind.
 # ══════════════════════════════════════════════════════════
 
-# Get pipeline_id from spark.conf to make anchor name unique
-try:
-    _pipeline_id = spark.conf.get("pipelines.id", "default").replace("-","")[:8]
-except Exception:
-    _pipeline_id = "default"
+_first       = all_rows[0]
+_remaining   = all_rows[1:]
 
-_anchor_name = f"dlt_anchor_{GROUP_ID.lower()}_{_pipeline_id}"
+_first_src_schema  = _first["SOURCE_OBJ_SCHEMA"] or ""
+_first_src_table   = _first["SOURCE_OBJ_NAME"]   or ""
+_first_tgt_schema  = _first["TARGET_SCHEMA"]      or "gold"
+_first_tgt_table   = _first["TARGET_TABLE"]
+_first_query       = _first["TRANSFORMATION_QUERY"] or ""
+
+_first_select = resolve_refs(
+    extract_select(_first_query, _first_tgt_table),
+    _first_src_schema,
+    _first_tgt_schema
+)
+
+print(f"  First row  → @dlt.table (MATERIALIZED VIEW) : {CATALOG}.{_first_tgt_schema}.{_first_tgt_table}")
+for r in _remaining:
+    print(f"  Other rows → CREATE OR REPLACE VIEW         : {CATALOG}.{r['TARGET_SCHEMA']}.{r['TARGET_TABLE']}")
+
 
 @dlt.table(
-    name             = _anchor_name,
-    comment          = f"DLT anchor for {GROUP_ID} — required by DLT (min 1 table). Stored in admin.",
-    schema           = f"{CATALOG}.admin",
-    table_properties = {"quality": "bronze", "pipelines.autoOptimize.managed": "false"}
+    name    = _first_tgt_table,
+    comment = (
+        f"Materialized view for {GROUP_ID} | "
+        f"Source: {CATALOG}.{_first_src_schema}.{_first_src_table}"
+    ),
+    table_properties = {"quality": "gold"}
 )
-def _dlt_anchor():
+def _first_view():
     """
-    Minimal anchor table stored in admin schema.
-    Also creates all business views via spark.sql() inside this function
-    so views land in the correct target schema (gold / silver).
-    spark.sql() gives full control over schema — @dlt.view does not.
+    Registered as @dlt.table to satisfy DLT's table requirement.
+    Also creates all remaining views via spark.sql() so they
+    land in their correct TARGET_SCHEMA from the control table.
     """
-    created_views = []
-    failed_views  = []
 
-    for row in all_view_rows:
+    # ── Create remaining views via spark.sql ──────────────────
+    for row in _remaining:
         src_schema  = row["SOURCE_OBJ_SCHEMA"] or ""
         src_table   = row["SOURCE_OBJ_NAME"]   or ""
         tgt_schema  = row["TARGET_SCHEMA"]      or "gold"
@@ -164,47 +186,21 @@ def _dlt_anchor():
         trans_query = row["TRANSFORMATION_QUERY"] or ""
 
         if not tgt_table or not trans_query:
-            print(f"  ⚠️  Skipping — TARGET_TABLE or TRANSFORMATION_QUERY empty")
+            print(f"  ⚠️  Skipping — empty TARGET_TABLE or TRANSFORMATION_QUERY")
             continue
 
         full_view = f"{CATALOG}.{tgt_schema}.{tgt_table}"
-
         try:
-            # Extract pure SELECT
-            select_sql = extract_select(trans_query, tgt_table)
-            # Resolve catalog references
-            select_sql = resolve_refs(select_sql, src_schema, src_table)
-
-            # Ensure target schema exists
+            select_sql = resolve_refs(
+                extract_select(trans_query, tgt_table),
+                src_schema, src_table
+            )
             spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{tgt_schema}")
-
-            # CREATE OR REPLACE VIEW in the correct target schema
             spark.sql(f"CREATE OR REPLACE VIEW {full_view} AS {select_sql}")
-
-            # Validate view is accessible
             spark.sql(f"SELECT 1 FROM {full_view} LIMIT 1")
-
-            created_views.append(full_view)
             print(f"  ✅ View created : {full_view}")
-            print(f"     Source      : {CATALOG}.{src_schema}.{src_table}")
-
         except Exception as e:
-            failed_views.append(tgt_table)
-            print(f"  ❌ Failed to create view '{full_view}': {e}")
+            raise Exception(f"Failed to create view '{full_view}': {e}")
 
-    # Report
-    print(f"\n  Views created : {len(created_views)}")
-    for v in created_views:
-        print(f"    ✅ {v}")
-    if failed_views:
-        raise Exception(
-            f"View creation failed for: {failed_views}\n"
-            f"Check TRANSFORMATION_QUERY in control tables."
-        )
-
-    # Return anchor table content (1 row per run)
-    return spark.createDataFrame(
-        [(GROUP_ID, RUN_LAYER, len(created_views), ",".join(created_views), str(datetime.now()))],
-        ["GROUP_ID", "RUN_LAYER", "VIEWS_CREATED", "VIEW_NAMES", "RUN_TS"]
-    )
-
+    # ── Return first view's data (becomes the DLT table) ──────
+    return spark.sql(_first_select)
