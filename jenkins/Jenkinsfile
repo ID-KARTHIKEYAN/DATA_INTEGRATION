@@ -666,8 +666,6 @@ pipeline {
         stage('Trigger View Pipeline') {
             when {
                 expression {
-                    // Trigger DLT independently — does not wait for DLT to finish
-                    // Just fires and continues
                     return currentBuild.currentResult == 'SUCCESS'
                 }
             }
@@ -687,26 +685,25 @@ pipeline {
 
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
 
-                                def catalog  = wsLocal.catalog ?: 'demo_catalog'
-                                def wsUrl    = wsLocal.workspace_url
+                                def catalog = wsLocal.catalog ?: 'demo_catalog'
+                                def wsUrl   = wsLocal.workspace_url
 
-                                // ── Get warehouse for control table query ─────
+                                // ── Get warehouse for count query ─────────────
                                 def whRaw  = sh(
                                     returnStdout: true,
                                     script: "curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
                                 ).trim()
-
                                 def whJson     = readJSON text: whRaw
                                 def warehouses = whJson.warehouses ?: []
 
                                 if (warehouses.isEmpty()) {
-                                    echo "  ⚠️  No warehouse in ${wsLocal.name} — skipping"
+                                    echo "  ⚠️  No warehouse — skipping view check"
                                     return
                                 }
 
                                 def warehouseId = warehouses[0].id
 
-                                // ── Query helper ──────────────────────────────
+                                // ── SQL query helper ──────────────────────────
                                 def querySQL = { String sqlText ->
                                     def payload = [
                                         statement       : sqlText,
@@ -717,7 +714,6 @@ pipeline {
                                     def pJson   = writeJSON(returnText: true, json: payload)
                                     def tmpFile = "/tmp/vq_${wsLocal.name}_${System.currentTimeMillis()}.json"
                                     writeFile file: tmpFile, text: pJson
-
                                     def qRaw = sh(
                                         returnStdout: true,
                                         script: """
@@ -728,85 +724,107 @@ pipeline {
                                             -d @${tmpFile}
                                         """
                                     ).trim()
-
                                     sh "rm -f ${tmpFile}"
-
                                     def qLines = qRaw.split('\n')
-                                    def qCode  = qLines[-1]
-                                    def qBody  = qLines[0..-2].join('\n')
-
-                                    if (qCode != '200') { return [] }
-                                    def qJson = readJSON text: qBody
+                                    if (qLines[-1] != '200') { return [] }
+                                    def qJson = readJSON text: qLines[0..-2].join('\n')
                                     if (qJson.status?.state == 'FAILED') { return [] }
                                     return qJson.result?.data_array ?: []
                                 }
 
-                                // ── Check L1 + L2 for VIEW rows ───────────────
-                                def l1Views = querySQL(
-                                    "SELECT COUNT(*) FROM ${catalog}.admin.data_flow_l1_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y' AND UPPER(LOAD_TYPE) = 'VIEW'"
-                                )
-                                def l2Views = querySQL(
-                                    "SELECT COUNT(*) FROM ${catalog}.admin.data_flow_l2_detail WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y' AND UPPER(LOAD_TYPE) = 'VIEW'"
-                                )
+                                // ── Query L1 + L2 for VIEW rows ───────────────
+                                // Fetch TARGET_SCHEMA dynamically — never hardcode gold/silver
+                                def l1Views = querySQL("SELECT COUNT(*), MAX(TARGET_SCHEMA) FROM ${catalog}.admin.data_flow_l1_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
+                                def l2Views = querySQL("SELECT COUNT(*), MAX(TARGET_SCHEMA) FROM ${catalog}.admin.data_flow_l2_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
 
                                 def l1Count    = l1Views ? (l1Views[0][0] as int) : 0
                                 def l2Count    = l2Views ? (l2Views[0][0] as int) : 0
                                 def totalViews = l1Count + l2Count
 
-                                echo "  VIEW rows : L1=${l1Count} | L2=${l2Count} | Total=${totalViews}"
+                                // Resolve target schema from control table rows
+                                def l1Schema   = (l1Count > 0 && l1Views[0][1]) ? l1Views[0][1].toString().trim() : ''
+                                def l2Schema   = (l2Count > 0 && l2Views[0][1]) ? l2Views[0][1].toString().trim() : ''
+
+                                // Pipeline target schema: prefer L1 schema if present, else L2
+                                // DLT uses this as the default schema for @dlt.table outputs
+                                def pipelineTarget = l1Schema ?: l2Schema ?: 'silver'
+
+                                echo "  VIEW rows : L1=${l1Count}(schema=${l1Schema}) | L2=${l2Count}(schema=${l2Schema})"
+                                echo "  Pipeline target schema : ${pipelineTarget}"
 
                                 if (totalViews == 0) {
-                                    echo "  ℹ️  No VIEW rows for ${groupId} — skipping DLT pipeline"
+                                    echo "  ℹ️  No VIEW rows — skipping DLT pipeline"
                                     return
                                 }
 
+                                // Auto-detect layer
                                 def viewLayer = 'ALL'
                                 if      (l1Count > 0 && l2Count == 0) viewLayer = 'L1'
                                 else if (l2Count > 0 && l1Count == 0) viewLayer = 'L2'
 
-                                // ── DLT pipeline naming convention ────────────
-                                // Main job    : DBX_{GROUP_ID}_JOB
-                                // View DLT    : DBX_{GROUP_ID}_DLT
+                                // DLT pipeline name: DBX_{GROUP_ID}_DLT
                                 def dltName      = "DBX_${groupId}_DLT"
                                 def notebookPath = "${wsLocal.github_repo_path}/notebooks/view_pipeline"
 
-                                // ── Check if DLT pipeline already exists ──────
+                                // ── Find or create DLT pipeline ───────────────
                                 def listRaw = sh(
                                     returnStdout: true,
                                     script: "curl -s -X GET '${wsUrl}/api/2.0/pipelines' -H 'Authorization: Bearer ${DB_TOKEN}'"
                                 ).trim()
 
-                                def listJson       = readJSON text: listRaw
-                                def existingDlt    = listJson.statuses?.find { p ->
-                                    p.name == dltName
-                                }
-
-                                def dltPipelineId
+                                def listJson    = readJSON text: listRaw
+                                def existingDlt = listJson.statuses?.find { p -> p.name == dltName }
+                                def dltId
 
                                 if (existingDlt) {
-                                    dltPipelineId = existingDlt.pipeline_id
-                                    echo "  ✅ DLT pipeline exists — pipeline_id: ${dltPipelineId}"
+                                    dltId = existingDlt.pipeline_id
+                                    echo "  ✅ DLT pipeline exists — pipeline_id: ${dltId}"
 
-                                } else {
-                                    // ── Create DLT Pipeline (not a Job) ──────────
-                                    // Uses /api/2.0/pipelines endpoint
-                                    // notebook source = view_pipeline.py from GitHub Repo
-                                    // serverless requires catalog for Unity Catalog
-                                    def dltPayload = [
-                                        name       : dltName,
-                                        serverless : true,
-                                        continuous : false,
-                                        channel    : 'CURRENT',
-                                        catalog    : catalog,
-                                        target     : 'gold',
-                                        libraries  : [[
-                                            notebook: [
-                                                path: notebookPath
-                                            ]
-                                        ]],
+                                    // Update configuration on existing pipeline
+                                    def updatePayload = [
+                                        name      : dltName,
+                                        serverless: true,
+                                        catalog   : catalog,
+                                        target    : pipelineTarget,
+                                        continuous: false,
+                                        channel   : 'CURRENT',
+                                        libraries : [[notebook: [path: notebookPath]]],
                                         configuration: [
                                             GROUP_ID : groupId,
-                                            RUN_LAYER: viewLayer
+                                            RUN_LAYER: viewLayer,
+                                            catalog  : catalog
+                                        ]
+                                    ]
+                                    def updJson    = writeJSON(returnText: true, json: updatePayload)
+                                    def updTmpFile = "/tmp/dlt_upd_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                    writeFile file: updTmpFile, text: updJson
+
+                                    sh(script: """
+                                        curl -s -X PUT '${wsUrl}/api/2.0/pipelines/${dltId}' \
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                        -H 'Content-Type: application/json' \
+                                        -d @${updTmpFile}
+                                    """)
+                                    sh "rm -f ${updTmpFile}"
+
+                                } else {
+                                    // Create DLT pipeline with:
+                                    //   serverless: true    — required for free edition
+                                    //   catalog            — required for serverless
+                                    //   ONE @dlt.table anchor in notebook (view_pipeline_run_log)
+                                    //   dynamic @dlt.view for each VIEW row
+                                    def dltPayload = [
+                                        name      : dltName,
+                                        serverless: true,
+                                        catalog   : catalog,
+                                        target    : pipelineTarget,
+                                        continuous: false,
+                                        channel   : 'CURRENT',
+                                        libraries : [[notebook: [path: notebookPath]]],
+                                        configuration: [
+                                            GROUP_ID : groupId,
+                                            RUN_LAYER: viewLayer,
+                                            catalog  : catalog
                                         ]
                                     ]
 
@@ -832,51 +850,48 @@ pipeline {
                                     def createBody  = createLines[0..-2].join('\n')
 
                                     if (createCode != '200') {
-                                        error "DLT pipeline create failed HTTP ${createCode}: ${createBody}"
+                                        error "DLT create failed HTTP ${createCode}: ${createBody}"
                                     }
 
                                     def createJson = readJSON text: createBody
-                                    dltPipelineId  = createJson.pipeline_id
-
-                                    echo "  ✅ DLT pipeline created — pipeline_id: ${dltPipelineId}"
+                                    dltId          = createJson.pipeline_id
+                                    echo "  ✅ DLT pipeline created — pipeline_id: ${dltId}"
                                 }
 
-                                // ── Trigger the DLT pipeline ──────────────────
-                                // POST /api/2.0/pipelines/{id}/updates to start a run
-                                def updateRaw = sh(
+                                // ── Trigger DLT pipeline (fire & forget) ──────
+                                def trigRaw = sh(
                                     returnStdout: true,
                                     script: """
                                         curl -s -w "\n%{http_code}" \
-                                        -X POST '${wsUrl}/api/2.0/pipelines/${dltPipelineId}/updates' \
+                                        -X POST '${wsUrl}/api/2.0/pipelines/${dltId}/updates' \
                                         -H 'Authorization: Bearer ${DB_TOKEN}' \
                                         -H 'Content-Type: application/json' \
                                         -d '{"full_refresh":false}'
                                     """
                                 ).trim()
 
-                                def updateLines = updateRaw.split('\n')
-                                def updateCode  = updateLines[-1]
-                                def updateBody  = updateLines[0..-2].join('\n')
+                                def trigCode = trigRaw.split('\n')[-1]
+                                def trigBody = trigRaw.split('\n')[0..-2].join('\n')
 
-                                if (updateCode != '200') {
-                                    error "DLT trigger failed HTTP ${updateCode}: ${updateBody}"
+                                if (trigCode != '200') {
+                                    error "DLT trigger failed HTTP ${trigCode}: ${trigBody}"
                                 }
 
-                                def updateJson = readJSON text: updateBody
-                                def updateId   = updateJson.update_id ?: 'started'
+                                def trigJson = readJSON text: trigBody
+                                def updateId = trigJson.update_id ?: 'started'
 
                                 echo ""
-                                echo "  ┌─ DLT VIEW PIPELINE TRIGGERED ──────────────"
-                                echo "  │  Type        : Databricks Pipeline (DLT)"
+                                echo "  ┌─ DLT PIPELINE TRIGGERED ───────────────────"
                                 echo "  │  Name        : ${dltName}"
-                                echo "  │  Pipeline ID : ${dltPipelineId}"
+                                echo "  │  Pipeline ID : ${dltId}"
                                 echo "  │  Update ID   : ${updateId}"
                                 echo "  │  GROUP_ID    : ${groupId}"
                                 echo "  │  RUN_LAYER   : ${viewLayer}"
-                                echo "  │  Workspace   : ${wsLocal.name}"
                                 echo "  │  Notebook    : ${notebookPath}"
+                                echo "  │  Anchor tbl  : view_pipeline_run_log"
                                 echo "  │  L1 views    : ${l1Count}"
                                 echo "  │  L2 views    : ${l2Count}"
+                                echo "  │  Jenkins     : NOT waiting (async)"
                                 echo "  └────────────────────────────────────────────"
                                 echo "  Check: Databricks → Jobs & Pipelines → ${dltName}"
                             }
