@@ -159,7 +159,7 @@ def _make_dlt_table(row):
     """
     src_schema  = (row["SOURCE_OBJ_SCHEMA"] or "").strip()
     src_table   = (row["SOURCE_OBJ_NAME"]   or "").strip()
-    tgt_schema  = (row["TARGET_SCHEMA"]      or "gold").strip()
+    tgt_schema  = (row["TARGET_SCHEMA"]      or "").strip()
     tgt_table   = (row["TARGET_TABLE"]       or "").strip()
     raw_query   = (row["TRANSFORMATION_QUERY"] or "").strip()
 
