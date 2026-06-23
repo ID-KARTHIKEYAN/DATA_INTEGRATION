@@ -1,0 +1,324 @@
+// ============================================================
+// Jenkinsfile_git_sync
+// DATABRICKS-GIT-SYNC-PIPELINE
+// ============================================================
+// PURPOSE:
+//   Pulls latest GitHub changes into Databricks Repos
+//   across all (or selected) workspaces in one click.
+//   Run this whenever you push code changes to GitHub and
+//   want all workspaces to pick up the latest notebooks.
+//
+// STAGES:
+//   1. Validate
+//   2. Checkout repo (Jenkins local copy)
+//   3. Load workspace registry
+//   4. Sync each workspace Repo (parallel)
+//   5. Verify — list files changed per workspace
+// ============================================================
+
+pipeline {
+
+    agent any
+
+    parameters {
+
+        choice(
+            name: 'WORKSPACE',
+            choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace', 'RAJA_2005'],
+            description: 'Pull latest GitHub changes into this workspace (or ALL)'
+        )
+
+        string(
+            name: 'BRANCH',
+            defaultValue: 'main',
+            description: 'GitHub branch to pull (default: main)'
+        )
+
+        booleanParam(
+            name: 'CREATE_REPO_IF_MISSING',
+            defaultValue: true,
+            description: 'If Databricks Repo not connected yet — connect it automatically'
+        )
+
+        booleanParam(
+            name: 'SHOW_CHANGED_FILES',
+            defaultValue: true,
+            description: 'Print list of recently changed files after sync'
+        )
+    }
+
+    environment {
+        GITHUB_REPO  = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+        GITHUB_API   = 'https://api.github.com'
+        GITHUB_OWNER = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME = 'DATA_INTEGRATION'
+    }
+
+    stages {
+
+        // ========================================================
+        // STAGE 1 — VALIDATE
+        // ========================================================
+
+        stage('Validate') {
+            steps {
+                script {
+                    def branch = params.BRANCH?.trim() ?: 'main'
+                    env.SYNC_BRANCH = branch
+
+                    echo "======================================================"
+                    echo "  WORKSPACE : ${params.WORKSPACE}"
+                    echo "  BRANCH    : ${branch}"
+                    echo "  AUTO-CONNECT MISSING REPOS : ${params.CREATE_REPO_IF_MISSING}"
+                    echo "======================================================"
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 2 — CHECKOUT (Jenkins local copy)
+        // ========================================================
+
+        stage('Checkout Repo') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.SYNC_BRANCH}"]],
+                    userRemoteConfigs: [[url: env.GITHUB_REPO]]
+                ])
+                echo "Local checkout done — branch: ${env.SYNC_BRANCH}"
+            }
+        }
+
+        // ========================================================
+        // STAGE 3 — LOAD WORKSPACE REGISTRY
+        // ========================================================
+
+        stage('Load Workspace Registry') {
+            steps {
+                script {
+                    def rawText  = readFile('workspaces.json')
+                    def registry = readJSON text: rawText
+
+                    def selected = registry.workspaces.findAll { ws ->
+                        ws.is_active &&
+                        (params.WORKSPACE == 'ALL' || ws.name == params.WORKSPACE)
+                    }
+
+                    if (selected.isEmpty()) {
+                        error "No active workspaces found for: ${params.WORKSPACE}"
+                    }
+
+                    env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: selected)
+
+                    echo "Workspaces to sync:"
+                    selected.each { echo "  - ${it.name} | ${it.workspace_url}" }
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 4 — SYNC DATABRICKS REPOS (parallel)
+        // ========================================================
+
+        stage('Sync Databricks Repos') {
+            steps {
+                script {
+
+                    def wsRaw       = env.SELECTED_WORKSPACES
+                    def workspaces  = readJSON text: wsRaw
+                    def parallelMap = [:]
+                    def results     = [:]
+
+                    workspaces.each { ws ->
+
+                        def wsLocal = ws
+
+                        parallelMap[wsLocal.name] = {
+
+                            withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
+
+                                echo "Syncing : ${wsLocal.name}"
+                                echo "  URL   : ${wsLocal.workspace_url}"
+                                echo "  Repo  : ${wsLocal.github_repo_path}"
+                                echo "  Branch: ${env.SYNC_BRANCH}"
+
+                                // ── GET current repos list ────────────────────
+                                def listRaw  = sh(
+                                    returnStdout: true,
+                                    script: """
+                                        curl -s -X GET '${wsLocal.workspace_url}/api/2.0/repos' \
+                                        -H 'Authorization: Bearer ${DB_TOKEN}'
+                                    """
+                                ).trim()
+
+                                def listJson = readJSON text: listRaw
+                                def repo     = listJson.repos?.find { r ->
+                                    r.path == wsLocal.github_repo_path
+                                }
+
+                                if (!repo) {
+                                    // ── Repo not connected ────────────────────
+                                    if (params.CREATE_REPO_IF_MISSING) {
+
+                                        echo "  ⚠️  Repo not found — connecting now..."
+
+                                        def createPayload = [
+                                            url     : env.GITHUB_REPO,
+                                            provider: 'gitHub',
+                                            path    : wsLocal.github_repo_path
+                                        ]
+
+                                        def cpJson   = writeJSON(returnText: true, json: createPayload)
+                                        def cpTmp    = "/tmp/repo_create_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                        writeFile file: cpTmp, text: cpJson
+
+                                        def createRaw = sh(
+                                            returnStdout: true,
+                                            script: """
+                                                curl -s -w "\\n%{http_code}" \
+                                                -X POST '${wsLocal.workspace_url}/api/2.0/repos' \
+                                                -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                                -H 'Content-Type: application/json' \
+                                                -d @${cpTmp}
+                                            """
+                                        ).trim()
+
+                                        sh "rm -f ${cpTmp}"
+
+                                        def createCode = createRaw.split('\n')[-1]
+                                        def createBody = createRaw.split('\n')[0..-2].join('\n')
+
+                                        if (createCode == '200' || createCode == '201') {
+                                            def createJson = readJSON text: createBody
+                                            repo = createJson
+                                            echo "  ✅ Repo connected — id: ${repo.id}"
+                                        } else {
+                                            echo "  ❌ Repo connect failed HTTP ${createCode}: ${createBody}"
+                                            echo "  ℹ️  Connect manually: Databricks → Repos → Add Repo"
+                                            results[wsLocal.name] = 'SKIPPED — repo connect failed'
+                                            return
+                                        }
+
+                                    } else {
+                                        echo "  ⚠️  Repo not found at ${wsLocal.github_repo_path}"
+                                        echo "  ℹ️  Set CREATE_REPO_IF_MISSING=true to auto-connect"
+                                        echo "  ℹ️  Or: Databricks → Repos → Add Repo → ${env.GITHUB_REPO}"
+                                        results[wsLocal.name] = 'SKIPPED — repo not connected'
+                                        return
+                                    }
+                                }
+
+                                // ── PATCH — pull latest branch ────────────────
+                                def patchPayload = [branch: env.SYNC_BRANCH]
+                                def ppJson       = writeJSON(returnText: true, json: patchPayload)
+                                def ppTmp        = "/tmp/repo_patch_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                writeFile file: ppTmp, text: ppJson
+
+                                def patchRaw = sh(
+                                    returnStdout: true,
+                                    script: """
+                                        curl -s -w "\\n%{http_code}" \
+                                        -X PATCH '${wsLocal.workspace_url}/api/2.0/repos/${repo.id}' \
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                        -H 'Content-Type: application/json' \
+                                        -d @${ppTmp}
+                                    """
+                                ).trim()
+
+                                sh "rm -f ${ppTmp}"
+
+                                def patchLines = patchRaw.split('\n')
+                                def patchCode  = patchLines[-1]
+                                def patchBody  = patchLines[0..-2].join('\n')
+
+                                if (patchCode == '200') {
+                                    def patchJson  = readJSON text: patchBody
+                                    def newCommit  = patchJson.head_commit_id ?: 'unknown'
+                                    echo ""
+                                    echo "  ┌─ SYNC SUCCESS ────────────────────────────"
+                                    echo "  │  Workspace : ${wsLocal.name}"
+                                    echo "  │  Repo ID   : ${repo.id}"
+                                    echo "  │  Branch    : ${env.SYNC_BRANCH}"
+                                    echo "  │  Commit    : ${newCommit}"
+                                    echo "  │  Path      : ${wsLocal.github_repo_path}"
+                                    echo "  └────────────────────────────────────────────"
+                                    results[wsLocal.name] = "SUCCESS | commit: ${newCommit}"
+
+                                } else {
+                                    echo "  ❌ Sync failed HTTP ${patchCode}: ${patchBody}"
+                                    results[wsLocal.name] = "FAILED HTTP ${patchCode}"
+                                }
+                            }
+                        }
+                    }
+
+                    parallel parallelMap
+
+                    // Save results for verify stage
+                    env.SYNC_RESULTS = writeJSON(returnText: true, json: results)
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 5 — VERIFY — show recently changed files
+        // ========================================================
+
+        stage('Show Changed Files') {
+            when { expression { return params.SHOW_CHANGED_FILES } }
+            steps {
+                script {
+                    // Show files changed in last commit from local checkout
+                    def changedFiles = sh(
+                        returnStdout: true,
+                        script: """
+                            git diff --name-only HEAD~1 HEAD 2>/dev/null || \
+                            git show --stat HEAD --format='' 2>/dev/null | \
+                            grep '|' | awk '{print \$1}' || \
+                            echo '(could not determine changed files)'
+                        """
+                    ).trim()
+
+                    def lastCommit = sh(
+                        returnStdout: true,
+                        script: "git log -1 --format='%H | %s | %an | %ar' 2>/dev/null || echo 'unknown'"
+                    ).trim()
+
+                    echo ""
+                    echo "======================================================"
+                    echo "  LAST COMMIT"
+                    echo "  ${lastCommit}"
+                    echo "------------------------------------------------------"
+                    echo "  FILES SYNCED TO ALL WORKSPACES:"
+                    changedFiles.split('\n').each { f ->
+                        if (f?.trim()) echo "    → ${f.trim()}"
+                    }
+                    echo "======================================================"
+
+                    // Print sync summary per workspace
+                    def rawResults  = env.SYNC_RESULTS
+                    def syncResults = readJSON text: rawResults
+
+                    echo ""
+                    echo "======================================================"
+                    echo "  SYNC SUMMARY"
+                    echo "======================================================"
+                    syncResults.each { wsName, status ->
+                        def icon = status.startsWith('SUCCESS') ? '✅' : '❌'
+                        echo "  ${icon}  ${wsName} : ${status}"
+                    }
+                    echo "======================================================"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "WORKSPACE: ${params.WORKSPACE} | BRANCH: ${params.BRANCH} | STATUS: ${currentBuild.currentResult}"
+        }
+        success { echo "GIT SYNC SUCCESS — all workspaces are up to date" }
+        failure { echo "GIT SYNC FAILED — check logs above" }
+    }
+}
