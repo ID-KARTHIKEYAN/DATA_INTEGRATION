@@ -411,6 +411,7 @@ pipeline {
             when { expression { return params.CREATE_JOBS } }
             steps {
                 script {
+
                     def workspaces  = readJSON text: env.SELECTED_WORKSPACES
                     def parallelMap = [:]
 
@@ -419,62 +420,173 @@ pipeline {
                         def wsLocal = ws
 
                         parallelMap[wsLocal.name] = {
+
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
 
-                                echo "Create/Verify : ${wsLocal.name} | ${params.GROUP_ID}"
+                                def groupId      = params.GROUP_ID.trim().toUpperCase()
+                                def catalog      = wsLocal.catalog ?: 'demo_catalog'
+                                def wsUrl        = wsLocal.workspace_url
+                                def notebookPath = "${wsLocal.github_repo_path}/notebooks/run_framework"
+                                def jobName      = "DBX_${groupId}_JOB"
 
-                                // ── Check existing ────────────────────────────
-                                def listRaw  = sh(
+                                echo "=================================================="
+                                echo "Create/Verify : ${wsLocal.name} | ${jobName}"
+                                echo "=================================================="
+
+                                // ── Step 1: Get warehouse for control table query ─
+                                def whRaw  = sh(
                                     returnStdout: true,
-                                    script: "curl -s -X GET '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                    script: "curl -s -X GET '${wsUrl}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'"
                                 ).trim()
+                                def whJson     = readJSON text: whRaw
+                                def warehouses = whJson.warehouses ?: []
 
-                                def listJson    = readJSON text: listRaw
-                                def existingJob = listJson.jobs?.find { j ->
-                                    j.settings?.name == 'DBX_' + params.GROUP_ID + '_JOB'
+                                if (warehouses.isEmpty()) {
+                                    error "No SQL warehouse in ${wsLocal.name}."
+                                }
+                                def warehouseId = warehouses[0].id
+
+                                // ── Step 2: Query control table — one task per table ─
+                                // Detect which detail table to use from layer
+                                def detailTable = 'data_flow_l0_detail'
+                                if      (env.DETECTED_LAYER == 'L1') detailTable = 'data_flow_l1_detail'
+                                else if (env.DETECTED_LAYER == 'L2') detailTable = 'data_flow_l2_detail'
+
+                                def qPayload = [
+                                    statement      : "SELECT TARGET_TABLE, TARGET_SCHEMA FROM ${catalog}.admin.${detailTable} WHERE DATA_FLOW_GROUP_ID = '${groupId}' AND IS_ACTIVE = 'Y' AND UPPER(LOAD_TYPE) != 'VIEW' ORDER BY TARGET_TABLE",
+                                    warehouse_id   : warehouseId,
+                                    wait_timeout   : '50s',
+                                    on_wait_timeout: 'CANCEL'
+                                ]
+                                def qJson   = writeJSON(returnText: true, json: qPayload)
+                                def qTmp    = "/tmp/ctrl_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                writeFile file: qTmp, text: qJson
+
+                                def qRaw = sh(
+                                    returnStdout: true,
+                                    script: """
+                                        curl -s -w "\n%{http_code}" \
+                                        -X POST '${wsUrl}/api/2.0/sql/statements' \
+                                        -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                        -H 'Content-Type: application/json' \
+                                        -d @${qTmp}
+                                    """
+                                ).trim()
+                                sh "rm -f ${qTmp}"
+
+                                def qLines  = qRaw.split('\n')
+                                def qCode   = qLines[-1]
+                                def qBody   = qLines[0..-2].join('\n')
+
+                                if (qCode != '200') {
+                                    error "Control table query failed HTTP ${qCode}: ${qBody}"
                                 }
 
+                                def qResult = readJSON text: qBody
+                                def tableRows = qResult.result?.data_array ?: []
+
+                                if (tableRows.isEmpty()) {
+                                    echo "  ⚠️  No table rows found in ${detailTable} for ${groupId} — creating single-task job"
+                                }
+
+                                echo "  Tables found : ${tableRows.size()} → one task per table"
+                                tableRows.each { r -> echo "    - ${r[0]} (${r[1]})" }
+
+                                // ── Step 3: Check if job exists ───────────────────
+                                def listRaw  = sh(
+                                    returnStdout: true,
+                                    script: "curl -s -X GET '${wsUrl}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'"
+                                ).trim()
+                                def listJson    = readJSON text: listRaw
+                                def existingJob = listJson.jobs?.find { j -> j.settings?.name == jobName }
+
+                                // Auto-recreate if task count doesn't match control table
                                 if (existingJob) {
-                                    wsLocal.job_id = existingJob.job_id
+                                    def existingTaskCount = existingJob.settings?.tasks?.size() ?: 1
+                                    def expectedTaskCount = tableRows.isEmpty() ? 1 : tableRows.size()
 
-                                    // [NEW] Print bundle summary for existing job
-                                    echo ""
-                                    echo "  ┌─ JOB EXISTS ──────────────────────────────"
-                                    echo "  │  Name      : DBX_${params.GROUP_ID}_JOB"
-                                    echo "  │  Job ID    : ${wsLocal.job_id}"
-                                    echo "  │  Workspace : ${wsLocal.name}"
-                                    echo "  │  Notebook  : ${wsLocal.github_repo_path}/notebooks/run_framework"
-                                    echo "  │  Source    : WORKSPACE (live from GitHub)"
-                                    echo "  │  Bundle    : ${env.BUNDLE_INFO}"
-                                    echo "  └────────────────────────────────────────────"
+                                    if (existingTaskCount == expectedTaskCount) {
+                                        // Up to date — keep existing job
+                                        wsLocal.job_id = existingJob.job_id
+                                        echo ""
+                                        echo "  ┌─ JOB EXISTS ✅ ─────────────────────────────"
+                                        echo "  │  Name    : ${jobName}"
+                                        echo "  │  Job ID  : ${wsLocal.job_id}"
+                                        echo "  │  Tasks   : ${existingTaskCount} matches control table"
+                                        echo "  └────────────────────────────────────────────"
 
-                                } else {
+                                    } else {
+                                        // Task count mismatch — delete old, recreate below
+                                        echo ""
+                                        echo "  ┌─ JOB OUTDATED — will recreate ─────────────"
+                                        echo "  │  Name      : ${jobName}"
+                                        echo "  │  Old tasks : ${existingTaskCount}"
+                                        echo "  │  New tasks : ${expectedTaskCount} (from control table)"
+                                        echo "  └────────────────────────────────────────────"
 
-                                    // ── [FIX] Build job via temp file ────────────
-                                    // Avoids all shell single-quote escaping issues
-                                    def notebookPath = "${wsLocal.github_repo_path}/notebooks/run_framework"
-                                    def bundleTag    = params.BUNDLE_TAG?.trim() ?: 'untagged'
-                                    def jobDesc      = "GROUP_ID:${params.GROUP_ID} | Layer:${env.DETECTED_LAYER} | Notebook:${notebookPath} | Source:WORKSPACE(GitHub) | Bundle:${bundleTag} | Version:${params.VERSION} | Deployed:${env.DEPLOY_TS}"
+                                        def delJson = writeJSON(returnText: true, json: [job_id: existingJob.job_id])
+                                        def delTmp  = "/tmp/deljob_${wsLocal.name}_${System.currentTimeMillis()}.json"
+                                        writeFile file: delTmp, text: delJson
+                                        sh "curl -s -X POST '${wsUrl}/api/2.1/jobs/delete' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${delTmp}"
+                                        sh "rm -f ${delTmp}"
+                                        echo "  Old job deleted — recreating with ${expectedTaskCount} task(s)..."
+                                        existingJob = null
+                                    }
+                                }
 
-                                    def jobPayload = [
-                                        name               : 'DBX_' + params.GROUP_ID + '_JOB',
-                                        description        : jobDesc,
-                                        max_concurrent_runs: 1,
-                                        parameters: [
-                                            [name: 'GROUP_ID',  default: params.GROUP_ID],
-                                            [name: 'RUN_LAYER', default: env.DETECTED_LAYER]
-                                        ],
-                                        tasks: [[
-                                            task_key     : "DBX_${params.GROUP_ID}_JOB_task",
+                                if (!existingJob) {
+
+                                    // ── Step 4: Build tasks — one per table ───────
+                                    def bundleTag = params.BUNDLE_TAG?.trim() ?: 'untagged'
+                                    def jobDesc   = "GROUP_ID:${groupId} | Layer:${env.DETECTED_LAYER} | Source:WORKSPACE(GitHub) | Bundle:${bundleTag} | Deployed:${env.DEPLOY_TS}"
+
+                                    // Build tasks list
+                                    def tasks = []
+
+                                    if (tableRows.isEmpty()) {
+                                        // fallback: single task, no target_load_table filter
+                                        tasks << [
+                                            task_key     : "${groupId}_task",
                                             notebook_task: [
                                                 notebook_path  : notebookPath,
                                                 base_parameters: [
-                                                    GROUP_ID : params.GROUP_ID,
-                                                    RUN_LAYER: env.DETECTED_LAYER
+                                                    GROUP_ID         : groupId,
+                                                    TARGET_LOAD_TABLE: '',
+                                                    ENVIRONMENT      : bundleTag
                                                 ],
                                                 source: 'WORKSPACE'
                                             ]
-                                        ]]
+                                        ]
+                                    } else {
+                                        // one task per table — matches reference company pattern
+                                        tableRows.each { r ->
+                                            def tblName  = r[0]   // TARGET_TABLE
+                                            def taskKey  = tblName.replaceAll('[^a-zA-Z0-9_]', '_')
+                                            tasks << [
+                                                task_key     : taskKey,
+                                                notebook_task: [
+                                                    notebook_path  : notebookPath,
+                                                    base_parameters: [
+                                                        GROUP_ID         : groupId,
+                                                        TARGET_LOAD_TABLE: tblName,
+                                                        ENVIRONMENT      : bundleTag
+                                                    ],
+                                                    source: 'WORKSPACE'
+                                                ]
+                                            ]
+                                        }
+                                    }
+
+                                    def jobPayload = [
+                                        name               : jobName,
+                                        description        : jobDesc,
+                                        max_concurrent_runs: 1,
+                                        parameters: [
+                                            [name: 'GROUP_ID',          default: groupId],
+                                            [name: 'TARGET_LOAD_TABLE', default: ''],
+                                            [name: 'ENVIRONMENT',       default: bundleTag]
+                                        ],
+                                        tasks: tasks
                                     ]
 
                                     def jobJson  = writeJSON(returnText: true, json: jobPayload)
@@ -484,14 +596,13 @@ pipeline {
                                     def createRaw = sh(
                                         returnStdout: true,
                                         script: """
-                                            curl -s -w "\\n%{http_code}" \\
-                                            -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' \\
-                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
-                                            -H 'Content-Type: application/json' \\
+                                            curl -s -w "\n%{http_code}" \
+                                            -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' \
+                                            -H 'Authorization: Bearer ${DB_TOKEN}' \
+                                            -H 'Content-Type: application/json' \
                                             -d @${tmpFile}
                                         """
                                     ).trim()
-
                                     sh "rm -f ${tmpFile}"
 
                                     def createLines = createRaw.split('\n')
@@ -505,19 +616,19 @@ pipeline {
                                     def createJson = readJSON text: createBody
                                     wsLocal.job_id = createJson.job_id
 
-                                    // [NEW] Print full bundle summary on create
                                     echo ""
-                                    echo "  ┌─ JOB CREATED ─────────────────────────────"
-                                    echo "  │  Name      : DBX_${params.GROUP_ID}_JOB"
-                                    echo "  │  Job ID    : ${wsLocal.job_id}"
-                                    echo "  │  Workspace : ${wsLocal.name}"
-                                    echo "  │  Notebook  : ${notebookPath}"
-                                    echo "  │  Source    : WORKSPACE (reads LIVE from GitHub)"
-                                    echo "  │  Layer     : ${env.DETECTED_LAYER}"
-                                    echo "  │  Version   : ${params.VERSION}"
-                                    echo "  │  Bundle    : ${bundleTag}"
-                                    echo "  │  Deployed  : ${env.DEPLOY_TS}"
-                                    echo "  │  Branch    : ${env.GITHUB_BRANCH}"
+                                    echo "  ┌─ JOB CREATED ──────────────────────────────"
+                                    echo "  │  Name     : ${jobName}"
+                                    echo "  │  Job ID   : ${wsLocal.job_id}"
+                                    echo "  │  Tasks    : ${tasks.size()} (one per table)"
+                                    tasks.each { t ->
+                                        def tbl = t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'
+                                        echo "  │    task: ${t.task_key}  →  table: ${tbl}"
+                                    }
+                                    echo "  │  Notebook : ${notebookPath}"
+                                    echo "  │  Source   : WORKSPACE (live from GitHub)"
+                                    echo "  │  Layer    : ${env.DETECTED_LAYER}"
+                                    echo "  │  Bundle   : ${bundleTag}"
                                     echo "  └────────────────────────────────────────────"
                                 }
                             }
@@ -529,6 +640,7 @@ pipeline {
                 }
             }
         }
+
 
         // ========================================================
         // STAGE 6 — TRIGGER DATABRICKS JOBS
@@ -554,7 +666,7 @@ pipeline {
                                         -X POST '${ws.workspace_url}/api/2.1/jobs/run-now' \\
                                         -H 'Authorization: Bearer ${DB_TOKEN}' \\
                                         -H 'Content-Type: application/json' \\
-                                        -d '{"job_id":${ws.job_id},"job_parameters":{"GROUP_ID":"${params.GROUP_ID}","RUN_LAYER":"${env.DETECTED_LAYER}"}}'
+                                        -d '{"job_id":${ws.job_id},"job_parameters":{"data_flow_group_id":"${params.GROUP_ID}","environment":"dev","lift_shift_mode":"","query_filter":"","target_load_table":""}}'
                                     """
                                 ).trim()
 
