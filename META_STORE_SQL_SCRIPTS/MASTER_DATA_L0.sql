@@ -1,17 +1,13 @@
--- ==============================================
--- Workspace : karthik_workspace
--- Group     : MASTER_DATA_L0
--- Bundle    : [v1.0] [untagged] deployed: 2026-06-23 03:47 | branch: main | layer: L0
--- ==============================================
+-- karthik_workspace | MASTER_DATA_L0 | [v1.0][untagged] 2026-06-26 06:11 | L0 | main
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
-USING (SELECT 'MASTER_DATA_L0' AS DATA_FLOW_GROUP_ID, 'MASTER_DATA_L0_JOB' AS JOB_NAME, '/Workspace/Users/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH, 'Y' AS IS_ACTIVE, current_timestamp() AS CREATED_DATE, current_timestamp() AS UPDATED_DATE) AS src
-ON tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID
-WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH = src.NOTEBOOK_PATH, tgt.IS_ACTIVE = src.IS_ACTIVE, tgt.UPDATED_DATE = src.UPDATED_DATE
+USING (SELECT 'MASTER_DATA_L0' AS DATA_FLOW_GROUP_ID,'MASTER_DATA_L0_JOB' AS JOB_NAME,'/Workspace/Users/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
+ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID
+WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH=src.NOTEBOOK_PATH,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
 
 MERGE INTO demo_catalog.admin.data_flow_l0_detail AS tgt
-USING (SELECT 'MASTER_DATA_L0' AS DATA_FLOW_GROUP_ID, 'https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json' AS SOURCE_URL, 'bronze' AS TARGET_SCHEMA, 'weather_large_json_raw' AS TARGET_TABLE, 'json' AS FILE_FORMAT, 'FULL' AS LOAD_TYPE, 'Y' AS IS_ACTIVE, current_timestamp() AS CREATED_DATE, current_timestamp() AS UPDATED_DATE) AS src
-ON tgt.DATA_FLOW_GROUP_ID = src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE = src.TARGET_TABLE
-WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL = src.SOURCE_URL, tgt.FILE_FORMAT = src.FILE_FORMAT, tgt.LOAD_TYPE = src.LOAD_TYPE, tgt.IS_ACTIVE = src.IS_ACTIVE, tgt.UPDATED_DATE = src.UPDATED_DATE
+USING (SELECT 'MASTER_DATA_L0' AS DATA_FLOW_GROUP_ID,'https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json' AS SOURCE_URL,'bronze' AS TARGET_SCHEMA,'weather_large_json_raw' AS TARGET_TABLE,'json' AS FILE_FORMAT,'FULL' AS LOAD_TYPE,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
+ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE
+WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL=src.SOURCE_URL,tgt.FILE_FORMAT=src.FILE_FORMAT,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
