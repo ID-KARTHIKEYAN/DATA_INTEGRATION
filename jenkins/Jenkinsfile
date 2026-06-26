@@ -201,7 +201,9 @@ pipeline {
                             def raw  = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${ws.workspace_url}/api/2.0/sql/statements' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tmp}").trim()
                             sh "rm -f ${tmp}"
                             def lines = raw.split('\n')
-                            def rows  = lines[-1] == '200' ? (readJSON(text: lines[0..-2].join('\n')).result?.data_array ?: []) : []
+                            def rowBody = lines[0..-2].join('\n')
+                                    def rowJson = lines[-1] == '200' ? readJSON(text: rowBody) : [:]
+                                    def rows    = rowJson.result?.data_array ?: []
                             tableMap[ws.name] = rows
                             echo "  ${ws.name}: ${rows.size()} table(s) in ${detail}"
                             rows.each { r -> echo "    → ${r[1]}.${r[0]}" }
@@ -275,7 +277,8 @@ pipeline {
                                     sh "rm -f ${jf}"
                                     def lines = raw.split('\n')
                                     if (lines[-1] != '200') error "Job create failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
-                                    wsLocal.job_id = (readJSON text: lines[0..-2].join('\n')).job_id
+                                    def cjson = readJSON text: lines[0..-2].join('\n')
+                                    wsLocal.job_id = cjson.job_id
                                     echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
                                     tasks.each { t -> echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'}" }
                                 }
@@ -307,7 +310,8 @@ pipeline {
                                 sh "rm -f ${tf}"
                                 def lines = raw.split('\n')
                                 if (lines[-1] != '200') error "Trigger failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
-                                def runId = (readJSON text: lines[0..-2].join('\n')).run_id
+                                def rjson = readJSON text: lines[0..-2].join('\n')
+                                def runId = rjson.run_id
                                 runIds[ws.name] = [run_id:runId, workspace_url:ws.workspace_url, credential_id:ws.credential_id]
                                 echo "  ${ws.name} triggered | run_id=${runId}"
                             }
@@ -416,7 +420,8 @@ pipeline {
                                     sh "rm -f ${vf}"
                                     def lines = raw.split('\n')
                                     if (lines[-1] != '200') error "View job create HTTP ${lines[-1]}"
-                                    vJobId = (readJSON text: lines[0..-2].join('\n')).job_id
+                                    def vjson = readJSON text: lines[0..-2].join('\n')
+                                        vJobId = vjson.job_id
                                     echo "  View job created: ${vJobId}"
                                 }
 
@@ -427,7 +432,8 @@ pipeline {
                                 sh "rm -f ${tf}"
                                 def tlines = tr.split('\n')
                                 if (tlines[-1] != '200') error "View trigger HTTP ${tlines[-1]}"
-                                def runId = (readJSON text: tlines[0..-2].join('\n')).run_id
+                                def trjson = readJSON text: tlines[0..-2].join('\n')
+                                def runId = trjson.run_id
                                 echo "  ${vJob} triggered | run_id=${runId} | layer=${vLayer}"
                             }
                         }
