@@ -258,7 +258,7 @@ pipeline {
                                 if (!existing) {
                                     // Build tasks list — one per table
                                     def tasks = tableRows.isEmpty()
-                                        ? [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'', ENVIRONMENT:tag], source:'WORKSPACE']]]
+                                        ? [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
                                         : tableRows.collect { r ->
                                             def tbl = r[0]
                                             [task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
@@ -268,7 +268,7 @@ pipeline {
                                     def jp  = writeJSON(returnText:true, json:[
                                         name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
                                         max_concurrent_runs:1,
-                                        parameters:[[name:'GROUP_ID',default:groupId],[name:'TARGET_LOAD_TABLE',default:''],[name:'ENVIRONMENT',default:tag]],
+                                        parameters:[[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
                                         tasks:tasks
                                     ])
                                     def jf  = "/tmp/job_${System.currentTimeMillis()}.json"
