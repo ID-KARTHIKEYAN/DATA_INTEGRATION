@@ -33,6 +33,17 @@
       "catalog"         : "demo_catalog",
       "github_repo_path": "/Workspace/Repos/raja@gmail.com/DATA_INTEGRATION",
       "is_active"       : true
+    },
+    {
+      "name"            : "user3_workspace",
+      "owner"           : "User3",
+      "jenkins_user"    : "USER3",
+      "workspace_url"   : "https://dbc-52566953-f07e.cloud.databricks.com",
+      "job_id"          : "2514585521553695",
+      "credential_id"   : "ADMIN_TEST_TOKEN",
+      "catalog"         : "demo_catalog",
+      "github_repo_path": "/Workspace/Repos/chennaigusts@gmail.com/DATA_INTEGRATION",
+      "is_active"       : true
     }
   ],
   "github": {
