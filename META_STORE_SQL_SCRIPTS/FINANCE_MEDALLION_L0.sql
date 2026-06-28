@@ -1,4 +1,4 @@
--- karthik_workspace | FINANCE_MEDALLION_L0 | [v1.0][untagged] 2026-06-26 06:20 | L0 | main
+-- karthik_workspace | FINANCE_MEDALLION_L0 | [v1.0][untagged] 2026-06-28 13:38 | L0 | main
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'FINANCE_MEDALLION_L0_JOB' AS JOB_NAME,'/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
