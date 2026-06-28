@@ -7,7 +7,6 @@ pipeline {
     agent any
 
     parameters {
-        choice(name: 'WORKSPACE', choices: ['ALL','karthik_workspace','MARAN_workspace','user3_workspace','RAJA_2005'], description: 'Target workspace')
         string(name: 'GROUP_ID',   defaultValue: '', description: 'e.g. FINANCE_MEDALLION_L0')
         string(name: 'BUNDLE_TAG', defaultValue: '', description: 'Release tag e.g. v1.0.0')
         string(name: 'VERSION',    defaultValue: '1.0', description: 'Pipeline version')
@@ -56,15 +55,40 @@ pipeline {
             }
         }
 
-        // ── STAGE 3 : LOAD REGISTRY ─────────────────────────
+        // ── STAGE 3 : LOAD REGISTRY (auto-detects workspace) ──
+        // No manual WORKSPACE selection needed.
+        // Jenkins username → matched to jenkins_user in workspaces.json
+        // Admin (DATAKALAMIT / no mapping) → all active workspaces
         stage('Load Registry') {
             steps {
                 script {
-                    def reg  = readJSON text: readFile('workspaces.json')
-                    def sel  = reg.workspaces.findAll { it.is_active && (params.WORKSPACE == 'ALL' || it.name == params.WORKSPACE) }
-                    if (sel.isEmpty()) error "No active workspaces for: ${params.WORKSPACE}"
+                    // Get Jenkins username who clicked Build
+                    def buildUser = currentBuild
+                        .getBuildCauses('hudson.model.Cause$UserIdCause')
+                        .collect { it?.userId }
+                        .find { it }
+                        ?: 'admin'
+
+                    echo "Build user : ${buildUser}"
+
+                    def wsRaw = readFile('workspaces.json')
+                    def reg   = readJSON text: wsRaw
+
+                    // Match by jenkins_user field
+                    def sel = reg.workspaces.findAll { ws ->
+                        ws.is_active == true && ws.jenkins_user == buildUser
+                    }
+
+                    if (sel.isEmpty()) {
+                        // No mapping found — admin mode: use all active workspaces
+                        echo "No mapping for '${buildUser}' — admin mode: all active workspaces"
+                        sel = reg.workspaces.findAll { it.is_active == true }
+                    }
+
+                    if (sel.isEmpty()) error "No active workspaces in workspaces.json"
+
                     env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: sel)
-                    sel.each { echo "  workspace: ${it.name} | catalog: ${it.catalog ?: 'demo_catalog'}" }
+                    sel.each { echo "  -> ${it.name} (${it.workspace_url})" }
                 }
             }
         }
@@ -445,7 +469,7 @@ pipeline {
     }
 
     post {
-        always { echo "GROUP_ID:${params.GROUP_ID} | WORKSPACE:${params.WORKSPACE} | LAYER:${env.DETECTED_LAYER} | STATUS:${currentBuild.currentResult}" }
+        always { echo "GROUP_ID:${params.GROUP_ID} | WORKSPACE:${params.WORKSPACE_OVERRIDE} | LAYER:${env.DETECTED_LAYER} | STATUS:${currentBuild.currentResult}" }
         success { echo "PIPELINE SUCCESS" }
         failure { echo "PIPELINE FAILED"  }
     }
