@@ -4,7 +4,7 @@
     {
       "name"            : "karthik_workspace",
       "owner"           : "Karthik",
-      "jenkins_user"    : "DATAKALAMIT",
+      "jenkins_user"    : "karthick",
       "workspace_url"   : "https://dbc-9e0f543c-87b6.cloud.databricks.com",
       "job_id"          : "",
       "credential_id"   : "DATABRICKS_TOKEN_KARTHIK",
