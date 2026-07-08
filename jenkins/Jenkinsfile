@@ -148,28 +148,81 @@ pipeline {
                             def hdr = runQ("SELECT DATA_FLOW_GROUP_ID, NOTEBOOK_PATH FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
                             if (hdr.isEmpty()) { echo "  ${ws.name}: no header for ${groupId}"; return }
 
-                            def det = runQ("SELECT SOURCE_URL, TARGET_SCHEMA, TARGET_TABLE, FILE_FORMAT, LOAD_TYPE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
-                            if (det.isEmpty()) { echo "  ${ws.name}: no detail rows"; return }
+                            // ── Query ALL three layers ─────────────────────
+                            def l0 = runQ("SELECT SOURCE_URL,SOURCE_OBJ_SCHEMA,SOURCE_OBJ_NAME,TARGET_SCHEMA,TARGET_TABLE,FILE_FORMAT,INPUT_FILE_FORMAT,LOAD_TYPE,DELIMETER FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
+                            def l1 = runQ("SELECT SOURCE_OBJ_SCHEMA,SOURCE_OBJ_NAME,TARGET_SCHEMA,TARGET_TABLE,LOAD_TYPE,TRANSFORMATION_QUERY,MERGE_KEYS,PARTITION_BY,DQ_LOGIC FROM ${catalog}.admin.data_flow_l1_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
+                            def l2 = runQ("SELECT SOURCE_OBJ_SCHEMA,SOURCE_OBJ_NAME,TARGET_SCHEMA,TARGET_TABLE,LOAD_TYPE,TRANSFORMATION_QUERY,MERGE_KEYS,PARTITION_BY,DQ_LOGIC FROM ${catalog}.admin.data_flow_l2_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
+
+                            if (l0.isEmpty() && l1.isEmpty() && l2.isEmpty()) {
+                                echo "  ${ws.name}: no rows in any layer — skipping"
+                                return
+                            }
 
                             def np = hdr[0][1]
-                            sqlLines << "-- ${ws.name} | ${groupId} | ${env.BUNDLE_INFO}"
+
+                            // ── FILE HEADER ────────────────────────────────
+                            sqlLines << "-- ============================================================"
+                            sqlLines << "-- Workspace : ${ws.name}"
+                            sqlLines << "-- GROUP_ID  : ${groupId}"
+                            sqlLines << "-- Layers    : L0(${l0.size()}) L1(${l1.size()}) L2(${l2.size()})"
+                            sqlLines << "-- Generated : ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+                            sqlLines << "-- Bundle    : ${env.BUNDLE_INFO}"
+                            sqlLines << "-- ============================================================"
                             sqlLines << ""
+
+                            // ── CONTROL HEADER ─────────────────────────────
+                            sqlLines << "-- control_header"
                             sqlLines << "MERGE INTO ${catalog}.admin.data_flow_control_header AS tgt"
                             sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${groupId}_JOB' AS JOB_NAME,'${np}' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
                             sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID"
                             sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH=src.NOTEBOOK_PATH,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
                             sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
                             sqlLines << ""
-                            det.each { r ->
-                                sqlLines << "MERGE INTO ${catalog}.admin.data_flow_l0_detail AS tgt"
-                                sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${r[0]}' AS SOURCE_URL,'${r[1]}' AS TARGET_SCHEMA,'${r[2]}' AS TARGET_TABLE,'${r[3]}' AS FILE_FORMAT,'${r[4]}' AS LOAD_TYPE,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
-                                sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE"
-                                sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL=src.SOURCE_URL,tgt.FILE_FORMAT=src.FILE_FORMAT,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
-                                sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
-                                sqlLines << ""
+
+                            // ── L0 DETAIL ──────────────────────────────────
+                            if (!l0.isEmpty()) {
+                                sqlLines << "-- L0 Bronze (${l0.size()} table/s)"
+                                l0.each { r ->
+                                    def safeQ = (r.size() > 5 && r[5]) ? r[5].toString().replace("'","''") : ""
+                                    sqlLines << "MERGE INTO ${catalog}.admin.data_flow_l0_detail AS tgt"
+                                    sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${r[0]}' AS SOURCE_URL,'${r[1]}' AS SOURCE_OBJ_SCHEMA,'${r[2]}' AS SOURCE_OBJ_NAME,'${r[3]}' AS TARGET_SCHEMA,'${r[4]}' AS TARGET_TABLE,'${r[5]}' AS FILE_FORMAT,'${r[6] ?: r[5]}' AS INPUT_FILE_FORMAT,'${r[7]}' AS LOAD_TYPE,'${r[8] ?: ","}' AS DELIMETER,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
+                                    sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE"
+                                    sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL=src.SOURCE_URL,tgt.FILE_FORMAT=src.FILE_FORMAT,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
+                                    sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
+                                    sqlLines << ""
+                                }
                             }
+
+                            // ── L1 DETAIL ──────────────────────────────────
+                            if (!l1.isEmpty()) {
+                                sqlLines << "-- L1 Silver (${l1.size()} table/s)"
+                                l1.each { r ->
+                                    def tq = (r[5] ?: "").toString().replace("'","''")
+                                    sqlLines << "MERGE INTO ${catalog}.admin.data_flow_l1_detail AS tgt"
+                                    sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${r[0]}' AS SOURCE_OBJ_SCHEMA,'${r[1]}' AS SOURCE_OBJ_NAME,'${r[2]}' AS TARGET_SCHEMA,'${r[3]}' AS TARGET_TABLE,'${r[4]}' AS LOAD_TYPE,'${tq}' AS TRANSFORMATION_QUERY,'${r[6] ?: ""}' AS MERGE_KEYS,'${r[7] ?: ""}' AS PARTITION_BY,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
+                                    sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE"
+                                    sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.TRANSFORMATION_QUERY=src.TRANSFORMATION_QUERY,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.MERGE_KEYS=src.MERGE_KEYS,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
+                                    sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
+                                    sqlLines << ""
+                                }
+                            }
+
+                            // ── L2 DETAIL ──────────────────────────────────
+                            if (!l2.isEmpty()) {
+                                sqlLines << "-- L2 Gold (${l2.size()} table/s)"
+                                l2.each { r ->
+                                    def tq = (r[5] ?: "").toString().replace("'","''")
+                                    sqlLines << "MERGE INTO ${catalog}.admin.data_flow_l2_detail AS tgt"
+                                    sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${r[0]}' AS SOURCE_OBJ_SCHEMA,'${r[1]}' AS SOURCE_OBJ_NAME,'${r[2]}' AS TARGET_SCHEMA,'${r[3]}' AS TARGET_TABLE,'${r[4]}' AS LOAD_TYPE,'${tq}' AS TRANSFORMATION_QUERY,'${r[6] ?: ""}' AS MERGE_KEYS,'${r[7] ?: ""}' AS PARTITION_BY,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
+                                    sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE"
+                                    sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.TRANSFORMATION_QUERY=src.TRANSFORMATION_QUERY,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.MERGE_KEYS=src.MERGE_KEYS,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
+                                    sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
+                                    sqlLines << ""
+                                }
+                            }
+
                             changed = true
-                            echo "  ${ws.name}: ${det.size()} rows collected"
+                            echo "  ${ws.name}: L0=${l0.size()} L1=${l1.size()} L2=${l2.size()} rows collected"
                         }
                     }
 
