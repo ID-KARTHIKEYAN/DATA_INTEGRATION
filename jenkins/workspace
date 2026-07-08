@@ -1,0 +1,462 @@
+// ============================================================
+// Jenkinsfile_workspace
+// WORKSPACE-MANAGEMENT-PIPELINE
+// ============================================================
+// Manages workspaces.json — add, update, deactivate members.
+// No manual JSON editing needed.
+// Actions:
+//   ADD    — add new member + update Jenkins + GitHub
+//   UPDATE — change workspace URL / catalog / credential
+//   DEACTIVATE — set is_active=false
+//   LIST   — show all current workspaces
+// ============================================================
+
+pipeline {
+
+    agent any
+
+    parameters {
+
+        choice(
+            name: 'ACTION',
+            choices: ['LIST', 'ADD', 'UPDATE', 'DEACTIVATE'],
+            description: 'What to do'
+        )
+
+        // ── Member details ────────────────────────────────────
+        string(
+            name: 'MEMBER_NAME',
+            defaultValue: '',
+            description: 'Full name  e.g. John'
+        )
+
+        string(
+            name: 'JENKINS_USERNAME',
+            defaultValue: '',
+            description: 'Jenkins login username — must match exactly  e.g. JOHN_2025'
+        )
+
+        string(
+            name: 'WORKSPACE_URL',
+            defaultValue: '',
+            description: 'Databricks workspace URL  e.g. https://dbc-XXXX.cloud.databricks.com'
+        )
+
+        string(
+            name: 'EMAIL',
+            defaultValue: '',
+            description: 'Email used in Databricks Repos path  e.g. john@gmail.com'
+        )
+
+        string(
+            name: 'CATALOG',
+            defaultValue: 'demo_catalog',
+            description: 'Unity Catalog name (leave as demo_catalog for free edition)'
+        )
+
+        string(
+            name: 'CREDENTIAL_ID',
+            defaultValue: '',
+            description: 'Jenkins credential ID for Databricks token  e.g. DATABRICKS_TOKEN_JOHN\nLeave blank — auto-generated as DATABRICKS_TOKEN_{NAME}'
+        )
+
+        string(
+            name: 'DATABRICKS_TOKEN',
+            defaultValue: '',
+            description: 'Databricks personal access token for new member\n(Settings → Developer → Access tokens in Databricks)\nThis will be stored securely as a Jenkins credential.'
+        )
+    }
+
+    environment {
+        GITHUB_REPO          = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
+        GITHUB_API           = 'https://api.github.com'
+        GITHUB_OWNER         = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
+        GITHUB_BRANCH        = 'main'
+        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
+    }
+
+    stages {
+
+        // ════════════════════════════════════════════════════
+        // STAGE 1 — VALIDATE
+        // ════════════════════════════════════════════════════
+
+        stage('Validate') {
+            steps {
+                script {
+                    echo "ACTION : ${params.ACTION}"
+
+                    if (params.ACTION in ['ADD', 'UPDATE', 'DEACTIVATE']) {
+                        if (!params.JENKINS_USERNAME?.trim()) {
+                            error "JENKINS_USERNAME is required for ${params.ACTION}"
+                        }
+                    }
+
+                    if (params.ACTION == 'ADD') {
+                        if (!params.MEMBER_NAME?.trim())    error "MEMBER_NAME is required for ADD"
+                        if (!params.WORKSPACE_URL?.trim())  error "WORKSPACE_URL is required for ADD"
+                        if (!params.EMAIL?.trim())          error "EMAIL is required for ADD"
+                        if (!params.DATABRICKS_TOKEN?.trim()) error "DATABRICKS_TOKEN is required for ADD"
+                    }
+
+                    if (params.ACTION == 'UPDATE') {
+                        if (!params.WORKSPACE_URL?.trim() && !params.CATALOG?.trim()) {
+                            error "UPDATE requires at least one of: WORKSPACE_URL, CATALOG"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 2 — CHECKOUT
+        // ════════════════════════════════════════════════════
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.GITHUB_BRANCH}"]],
+                    userRemoteConfigs: [[url: env.GITHUB_REPO]]
+                ])
+                echo "Repo checked out"
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 3 — LOAD workspaces.json
+        // ════════════════════════════════════════════════════
+
+        stage('Load Workspaces') {
+            steps {
+                script {
+                    def raw      = readFile('workspaces.json')
+                    def registry = readJSON text: raw
+                    env.WS_JSON  = writeJSON(returnText: true, json: registry)
+                    echo "Loaded ${registry.workspaces.size()} workspace(s)"
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 4 — LIST
+        // ════════════════════════════════════════════════════
+
+        stage('List Workspaces') {
+            when { expression { params.ACTION == 'LIST' } }
+            steps {
+                script {
+                    def registry = readJSON text: env.WS_JSON
+
+                    echo "\n══════════════════════════════════════════════"
+                    echo "  CURRENT WORKSPACES (${registry.workspaces.size()})"
+                    echo "══════════════════════════════════════════════"
+
+                    registry.workspaces.eachWithIndex { ws, i ->
+                        def status = ws.is_active ? '✅ ACTIVE' : '❌ INACTIVE'
+                        echo "\n  ${i+1}. ${ws.owner ?: ws.name}"
+                        echo "     Status       : ${status}"
+                        echo "     Jenkins User : ${ws.jenkins_user ?: 'NOT SET'}"
+                        echo "     Workspace    : ${ws.workspace_url}"
+                        echo "     Catalog      : ${ws.catalog ?: 'demo_catalog'}"
+                        echo "     Credential   : ${ws.credential_id}"
+                        echo "     Repo path    : ${ws.github_repo_path}"
+                    }
+
+                    echo "\n══════════════════════════════════════════════"
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 5 — ADD NEW MEMBER
+        // ════════════════════════════════════════════════════
+
+        stage('Add Member') {
+            when { expression { params.ACTION == 'ADD' } }
+            steps {
+                script {
+
+                    def registry  = readJSON text: env.WS_JSON
+                    def user      = params.JENKINS_USERNAME.trim().toUpperCase()
+                    def name      = params.MEMBER_NAME.trim()
+                    def email     = params.EMAIL.trim().toLowerCase()
+                    def wsUrl     = params.WORKSPACE_URL.trim().replaceAll('/$','')
+                    def catalog   = params.CATALOG?.trim() ?: 'demo_catalog'
+                    def wsSuffix  = name.toLowerCase().replaceAll('[^a-z0-9]','_')
+                    def wsName    = "${wsSuffix}_workspace"
+                    def credId    = params.CREDENTIAL_ID?.trim() ?: "DATABRICKS_TOKEN_${name.toUpperCase().replaceAll('[^A-Z0-9]','_')}"
+                    def repoPath  = "/Workspace/Repos/${email}/DATA_INTEGRATION"
+
+                    // ── Check for duplicates ──────────────────────
+                    def duplicate = registry.workspaces.find {
+                        it.jenkins_user == user || it.name == wsName
+                    }
+
+                    if (duplicate) {
+                        error (
+                            "Member already exists!\n" +
+                            "  jenkins_user: ${duplicate.jenkins_user}\n" +
+                            "  workspace   : ${duplicate.name}\n" +
+                            "Use ACTION=UPDATE to modify an existing entry."
+                        )
+                    }
+
+                    // ── Build new workspace entry ─────────────────
+                    def newEntry = [
+                        name            : wsName,
+                        owner           : name,
+                        jenkins_user    : user,
+                        workspace_url   : wsUrl,
+                        job_id          : '',
+                        credential_id   : credId,
+                        catalog         : catalog,
+                        github_repo_path: repoPath,
+                        is_active       : true
+                    ]
+
+                    registry.workspaces.add(newEntry)
+
+                    echo ""
+                    echo "  ┌─ NEW MEMBER ───────────────────────────────"
+                    echo "  │  Name          : ${name}"
+                    echo "  │  Jenkins User  : ${user}"
+                    echo "  │  Workspace     : ${wsName}"
+                    echo "  │  Workspace URL : ${wsUrl}"
+                    echo "  │  Catalog       : ${catalog}"
+                    echo "  │  Credential ID : ${credId}"
+                    echo "  │  Repo Path     : ${repoPath}"
+                    echo "  └────────────────────────────────────────────"
+
+                    env.WS_JSON      = writeJSON(returnText: true, json: registry)
+                    env.NEW_CRED_ID  = credId
+                    env.NEW_WS_NAME  = wsName
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 6 — UPDATE MEMBER
+        // ════════════════════════════════════════════════════
+
+        stage('Update Member') {
+            when { expression { params.ACTION == 'UPDATE' } }
+            steps {
+                script {
+                    def registry = readJSON text: env.WS_JSON
+                    def user     = params.JENKINS_USERNAME.trim().toUpperCase()
+                    def ws       = registry.workspaces.find { it.jenkins_user == user }
+
+                    if (!ws) {
+                        error "No workspace found for jenkins_user='${user}'"
+                    }
+
+                    echo "Updating : ${ws.name} (${ws.owner})"
+
+                    if (params.WORKSPACE_URL?.trim()) {
+                        ws.workspace_url = params.WORKSPACE_URL.trim().replaceAll('/$','')
+                        echo "  workspace_url updated"
+                    }
+                    if (params.CATALOG?.trim()) {
+                        ws.catalog = params.CATALOG.trim()
+                        echo "  catalog updated"
+                    }
+                    if (params.CREDENTIAL_ID?.trim()) {
+                        ws.credential_id = params.CREDENTIAL_ID.trim()
+                        echo "  credential_id updated"
+                    }
+                    if (params.EMAIL?.trim()) {
+                        ws.github_repo_path = "/Workspace/Repos/${params.EMAIL.trim().toLowerCase()}/DATA_INTEGRATION"
+                        echo "  github_repo_path updated"
+                    }
+
+                    env.WS_JSON = writeJSON(returnText: true, json: registry)
+                    echo "  ✅ ${ws.name} updated"
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 7 — DEACTIVATE MEMBER
+        // ════════════════════════════════════════════════════
+
+        stage('Deactivate Member') {
+            when { expression { params.ACTION == 'DEACTIVATE' } }
+            steps {
+                script {
+                    def registry = readJSON text: env.WS_JSON
+                    def user     = params.JENKINS_USERNAME.trim().toUpperCase()
+                    def ws       = registry.workspaces.find { it.jenkins_user == user }
+
+                    if (!ws) {
+                        error "No workspace found for jenkins_user='${user}'"
+                    }
+
+                    ws.is_active = false
+                    env.WS_JSON  = writeJSON(returnText: true, json: registry)
+
+                    echo "  ✅ ${ws.name} (${ws.owner}) — set to INACTIVE"
+                    echo "     They will no longer appear in pipeline runs."
+                    echo "     Use ACTION=UPDATE + is_active=true to reactivate."
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 8 — STORE DATABRICKS TOKEN IN JENKINS
+        // Only runs for ADD (token provided by member)
+        // ════════════════════════════════════════════════════
+
+        stage('Store Credential in Jenkins') {
+            when {
+                expression {
+                    params.ACTION == 'ADD' && params.DATABRICKS_TOKEN?.trim()
+                }
+            }
+            steps {
+                script {
+                    def credId = env.NEW_CRED_ID
+                    def token  = params.DATABRICKS_TOKEN.trim()
+
+                    // Use Jenkins CLI / Groovy to create the credential
+                    // This runs in the Jenkins script sandbox
+                    def credXml = """<org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>
+  <scope>GLOBAL</scope>
+  <id>${credId}</id>
+  <description>Databricks token for ${params.MEMBER_NAME} (auto-created by WORKSPACE-MANAGEMENT-PIPELINE)</description>
+  <secret>${token}</secret>
+</org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>"""
+
+                    writeFile file: '/tmp/new_cred.xml', text: credXml
+
+                    def result = sh(
+                        returnStatus: true,
+                        script: """
+                            curl -s -o /tmp/cred_result.txt -w "%{http_code}" \\
+                            -X POST "${env.JENKINS_URL}credentials/store/system/domain/_/createCredentials" \\
+                            --user "${env.BUILD_USER_ID}:${env.JENKINS_API_TOKEN}" \\
+                            -H "Content-Type: application/xml" \\
+                            --data-binary @/tmp/new_cred.xml
+                        """
+                    )
+
+                    if (result == 0) {
+                        echo "  ✅ Credential '${credId}' stored in Jenkins"
+                    } else {
+                        echo "  ⚠️  Could not auto-store credential via API."
+                        echo "  Manual step: Manage Jenkins → Credentials → Add"
+                        echo "    Kind     : Secret text"
+                        echo "    ID       : ${credId}"
+                        echo "    Secret   : (paste ${params.MEMBER_NAME}'s Databricks token)"
+                    }
+
+                    sh 'rm -f /tmp/new_cred.xml /tmp/cred_result.txt'
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 9 — PUSH workspaces.json TO GITHUB
+        // Skips for LIST action
+        // ════════════════════════════════════════════════════
+
+        stage('Push to GitHub') {
+            when {
+                expression { params.ACTION != 'LIST' }
+            }
+            steps {
+                script {
+                    def registry    = readJSON text: env.WS_JSON
+                    def updatedJson = writeJSON(returnText: true, json: registry)
+
+                    writeFile file: 'workspaces.json', text: updatedJson
+
+                    withCredentials([string(credentialsId: env.GITHUB_CREDENTIAL_ID, variable: 'GH_TOKEN')]) {
+
+                        // Get current SHA
+                        def shaRaw = sh(
+                            returnStdout: true,
+                            script: """
+                                curl -s -w "\\n%{http_code}" \\
+                                -X GET '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/workspaces.json?ref=${env.GITHUB_BRANCH}' \\
+                                -H 'Authorization: Bearer ${GH_TOKEN}'
+                            """
+                        ).trim()
+
+                        def shaLines = shaRaw.split('\n')
+                        def shaCode  = shaLines[-1]
+                        def shaBody  = shaLines[0..-2].join('\n')
+
+                        if (shaCode != '200') {
+                            error "Could not fetch workspaces.json from GitHub: HTTP ${shaCode}"
+                        }
+
+                        def shaJson = readJSON text: shaBody
+                        def fileSha = shaJson.sha
+
+                        // Base64 encode
+                        def tmpFile = '/tmp/ws_content.txt'
+                        writeFile file: tmpFile, text: updatedJson
+                        def b64 = sh(returnStdout: true, script: "base64 -w 0 ${tmpFile}").trim()
+                        sh "rm -f ${tmpFile}"
+
+                        // Push
+                        def action    = params.ACTION
+                        def user      = params.JENKINS_USERNAME?.trim() ?: ''
+                        def commitMsg = "${action.toLowerCase()}: ${user} workspace — [WORKSPACE-MANAGEMENT-PIPELINE]"
+
+                        def ghPayload     = [message: commitMsg, content: b64, sha: fileSha, branch: env.GITHUB_BRANCH]
+                        def ghPayloadJson = writeJSON(returnText: true, json: ghPayload)
+                        def ghTmp         = "/tmp/gh_ws_${System.currentTimeMillis()}.json"
+                        writeFile file: ghTmp, text: ghPayloadJson
+
+                        def pushRaw = sh(
+                            returnStdout: true,
+                            script: """
+                                curl -s -w "\\n%{http_code}" \\
+                                -X PUT '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/workspaces.json' \\
+                                -H 'Authorization: Bearer ${GH_TOKEN}' \\
+                                -H 'Content-Type: application/json' \\
+                                -d @${ghTmp}
+                            """
+                        ).trim()
+
+                        sh "rm -f ${ghTmp}"
+
+                        def pushCode = pushRaw.split('\n')[-1]
+                        if (pushCode in ['200', '201']) {
+                            echo "  ✅ workspaces.json pushed to GitHub"
+                        } else {
+                            error "GitHub push failed HTTP ${pushCode}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "\n══════════════════════════════════════════════"
+                echo "  ✅  ACTION=${params.ACTION} COMPLETE"
+                if (params.ACTION == 'ADD') {
+                    echo ""
+                    echo "  Next steps for ${params.MEMBER_NAME}:"
+                    echo "  1. Go to Databricks → Repos → Add repo"
+                    echo "     URL: https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git"
+                    echo "  2. Run DATABRICKS-FRAMEWORK-DEPLOYMENT-PIPELINE"
+                    echo "     WORKSPACE = ${env.NEW_WS_NAME ?: params.MEMBER_NAME}"
+                    echo "  3. ${params.MEMBER_NAME} can now log into Jenkins"
+                    echo "     and run ETL_DEPLOYMENT_PIPELINE directly —"
+                    echo "     workspace is auto-detected from their login."
+                }
+                echo "══════════════════════════════════════════════"
+            }
+        }
+        failure {
+            echo "ACTION=${params.ACTION} FAILED — check logs above"
+        }
+    }
+}
