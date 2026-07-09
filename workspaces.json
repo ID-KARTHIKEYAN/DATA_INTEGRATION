@@ -1,1 +1,66 @@
-{"_comment":"jenkins_user must match the Jenkins username exactly (case-sensitive)","workspaces":[{"name":"karthik_workspace","owner":"Karthik","jenkins_user":"karthick","workspace_url":"https://dbc-9e0f543c-87b6.cloud.databricks.com","job_id":"","credential_id":"DATABRICKS_TOKEN_KARTHIK","catalog":"demo_catalog","github_repo_path":"/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION","is_active":true},{"name":"MARAN_workspace","owner":"Maran","jenkins_user":"MARAN","workspace_url":"https://dbc-9f25f8d8-b402.cloud.databricks.com","job_id":"","credential_id":"DATABRICKS_TOKEN_MARAN","catalog":"demo_catalog","github_repo_path":"/Workspace/Repos/maran@gmail.com/DATA_INTEGRATION","is_active":true},{"name":"RAJA_workspace","owner":"Raja","jenkins_user":"RAJA_2005","workspace_url":"https://dbc-c1194db2-3f99.cloud.databricks.com","job_id":"","credential_id":"RAJA_TOKEN","catalog":"demo_catalog","github_repo_path":"/Workspace/Repos/raja@gmail.com/DATA_INTEGRATION","is_active":true},{"name":"user3_workspace","owner":"User3","jenkins_user":"USER3","workspace_url":"https://dbc-52566953-f07e.cloud.databricks.com","job_id":"2514585521553695","credential_id":"ADMIN_TEST_TOKEN","catalog":"demo_catalog","github_repo_path":"/Workspace/Repos/chennaigusts@gmail.com/DATA_INTEGRATION","is_active":true},{"name":{"valueCount":1,"strings":["","_workspace"],"bytes":[102,101,110,102,106,101,102,106,101,98,102,106,98,95,119,111,114,107,115,112,97,99,101],"values":["fenfjefjebfjb"],"empty":false},"owner":"fenfjefjebfjb","jenkins_user":"KENFKENFNEKNEKNKENG","workspace_url":"fejnjegnnegnngegngnjg","job_id":"","credential_id":{"valueCount":1,"strings":["DATABRICKS_TOKEN_",""],"bytes":[68,65,84,65,66,82,73,67,75,83,95,84,79,75,69,78,95,70,69,78,70,74,69,70,74,69,66,70,74,66],"values":["FENFJEFJEBFJB"],"empty":false},"catalog":"demo_catalog","github_repo_path":{"valueCount":1,"strings":["/Workspace/Repos/","/DATA_INTEGRATION"],"bytes":[47,87,111,114,107,115,112,97,99,101,47,82,101,112,111,115,47,110,102,101,110,103,101,103,106,101,110,103,101,103,110,103,110,47,68,65,84,65,95,73,78,84,69,71,82,65,84,73,79,78],"values":["nfengegjengegngn"],"empty":false},"is_active":true}],"github":{"repo_url":"https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git","branch":"main"}}
+{
+  "_readme": {
+    "purpose"     : "Maps Jenkins users to Databricks workspaces. One entry per team member.",
+    "how_to_add"  : "Copy the template block below, fill in all fields, set is_active to true.",
+    "jenkins_user": "Must match the Jenkins login username exactly (case-sensitive).",
+    "credential_id": "Must match a Secret Text credential added in Jenkins → Credentials."
+  },
+
+  "workspaces": [
+
+    {
+      "name"             : "karthik_workspace",
+      "owner"            : "Karthick",
+      "role"             : "admin",
+      "jenkins_user"     : "DATAKALAMIT",
+      "workspace_url"    : "https://dbc-9e0f543c-87b6.cloud.databricks.com",
+      "credential_id"    : "DATABRICKS_TOKEN_KARTHIK",
+      "catalog"          : "demo_catalog",
+      "github_repo_path" : "/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION",
+      "is_active"        : true
+    },
+
+    {
+      "name"             : "MARAN_workspace",
+      "owner"            : "Maran",
+      "role"             : "developer",
+      "jenkins_user"     : "MARAN",
+      "workspace_url"    : "https://dbc-9f25f8d8-b402.cloud.databricks.com",
+      "credential_id"    : "DATABRICKS_TOKEN_MARAN",
+      "catalog"          : "demo_catalog",
+      "github_repo_path" : "/Workspace/Repos/maran@gmail.com/DATA_INTEGRATION",
+      "is_active"        : true
+    },
+
+    {
+      "name"             : "RAJA_workspace",
+      "owner"            : "Raja",
+      "role"             : "developer",
+      "jenkins_user"     : "RAJA_2005",
+      "workspace_url"    : "https://dbc-XXXX-RAJA.cloud.databricks.com",
+      "credential_id"    : "DATABRICKS_TOKEN_RAJA",
+      "catalog"          : "demo_catalog",
+      "github_repo_path" : "/Workspace/Repos/raja@gmail.com/DATA_INTEGRATION",
+      "is_active"        : true
+    },
+
+    {
+      "_template"        : "COPY THIS BLOCK TO ADD A NEW MEMBER — remove _template key",
+      "name"             : "NEW_MEMBER_workspace",
+      "owner"            : "Full Name",
+      "role"             : "intern",
+      "jenkins_user"     : "JENKINS_USERNAME",
+      "workspace_url"    : "https://dbc-XXXX.cloud.databricks.com",
+      "credential_id"    : "DATABRICKS_TOKEN_NEWMEMBER",
+      "catalog"          : "demo_catalog",
+      "github_repo_path" : "/Workspace/Repos/email@gmail.com/DATA_INTEGRATION",
+      "is_active"        : false
+    }
+
+  ],
+
+  "github": {
+    "repo_url" : "https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git",
+    "branch"   : "main"
+  }
+}
