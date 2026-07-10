@@ -57,38 +57,74 @@ pipeline {
 
         // ── STAGE 3 : LOAD REGISTRY (auto-detects workspace) ──
         // No manual WORKSPACE selection needed.
-        // Jenkins username → matched to jenkins_user in workspaces.json
-        // Admin (DATAKALAMIT / no mapping) → all active workspaces
+        // Jenkins username → matched EXACTLY to jenkins_user in workspaces.json
+        // Each user only gets their own workspace — no fallback to all workspaces.
+        // Admin override: set WORKSPACE_OVERRIDE parameter to a specific workspace name.
         stage('Load Registry') {
             steps {
                 script {
-                    // Get Jenkins username who clicked Build
+                    // ── Get Jenkins username who clicked Build ────────────
+                    // Requires Build User Vars plugin to be installed.
+                    // Manage Jenkins → Plugins → search "Build User Vars Plugin"
                     def buildUser = currentBuild
                         .getBuildCauses('hudson.model.Cause$UserIdCause')
                         .collect { it?.userId }
                         .find { it }
-                        ?: 'admin'
+                        ?: env.BUILD_USER_ID
+                        ?: 'UNKNOWN'
 
-                    echo "Build user : ${buildUser}"
+                    echo "================================================"
+                    echo "  Build triggered by : ${buildUser}"
+                    echo "================================================"
 
                     def wsRaw = readFile('workspaces.json')
                     def reg   = readJSON text: wsRaw
 
-                    // Match by jenkins_user field
-                    def sel = reg.workspaces.findAll { ws ->
-                        ws.is_active == true && ws.jenkins_user == buildUser
-                    }
+                    def sel = []
 
-                    if (sel.isEmpty()) {
-                        // No mapping found — admin mode: use all active workspaces
-                        echo "No mapping for '${buildUser}' — admin mode: all active workspaces"
-                        sel = reg.workspaces.findAll { it.is_active == true }
-                    }
+                    if (params.WORKSPACE_OVERRIDE?.trim()) {
+                        // ── Admin override: specific workspace by name ────
+                        sel = reg.workspaces.findAll { ws ->
+                            ws.is_active == true &&
+                            !ws._template &&
+                            ws.name == params.WORKSPACE_OVERRIDE.trim()
+                        }
+                        if (sel.isEmpty()) {
+                            error (
+                                "WORKSPACE_OVERRIDE '${params.WORKSPACE_OVERRIDE}' not found.\n" +
+                                "Check workspace name in workspaces.json."
+                            )
+                        }
+                        echo "  Mode : ADMIN OVERRIDE → ${params.WORKSPACE_OVERRIDE}"
 
-                    if (sel.isEmpty()) error "No active workspaces in workspaces.json"
+                    } else {
+                        // ── Auto-detect: strict match on jenkins_user field ───
+                        // ONLY the workspace that belongs to this user is selected.
+                        // No fallback to all workspaces — prevents cross-deployment.
+                        sel = reg.workspaces.findAll { ws ->
+                            ws.is_active == true &&
+                            !ws._template &&
+                            ws.jenkins_user == buildUser
+                        }
+
+                        if (sel.isEmpty()) {
+                            error (
+                                "No workspace mapped to Jenkins user '${buildUser}'.\n" +
+                                "Fix: go to workspaces.json and add jenkins_user='${buildUser}' \n" +
+                                "     to your workspace entry, then push to GitHub.\n" +
+                                "Admin: run WORKSPACE-MANAGEMENT-PIPELINE with ACTION=ADD to register."
+                            )
+                        }
+                        echo "  Mode : AUTO-DETECT → matched jenkins_user='${buildUser}'"
+                    }
 
                     env.SELECTED_WORKSPACES = writeJSON(returnText: true, json: sel)
-                    sel.each { echo "  -> ${it.name} (${it.workspace_url})" }
+                    env.BUILD_USER_RESOLVED = buildUser
+
+                    echo "  Workspace(s) selected:"
+                    sel.each { ws ->
+                        echo "    ✅  ${ws.name} | ${ws.owner} | ${ws.workspace_url}"
+                    }
                 }
             }
         }
