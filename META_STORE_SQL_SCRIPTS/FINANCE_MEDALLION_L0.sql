@@ -1,27 +1,43 @@
--- karthik_workspace | FINANCE_MEDALLION_L0 | [v1.0][untagged] 2026-07-06 07:35 | L0 | main
+-- ============================================================
+-- Workspace : karthik_workspace
+-- GROUP_ID  : FINANCE_MEDALLION_L0
+-- Layers    : L0(1) L1(0) L2(0)
+-- Generated : 2026-07-10 06:08:09
+-- Bundle    : [v1.0][untagged] 2026-07-10 06:07 | L0 | main
+-- ============================================================
 
+-- control_header
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'FINANCE_MEDALLION_L0_JOB' AS JOB_NAME,'/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
 ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID
 WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH=src.NOTEBOOK_PATH,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
 
+-- L0 Bronze (1 table/s)
 MERGE INTO demo_catalog.admin.data_flow_l0_detail AS tgt
-USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv' AS SOURCE_URL,'bronze' AS TARGET_SCHEMA,'titanic_bronze' AS TARGET_TABLE,'csv' AS FILE_FORMAT,'FULL' AS LOAD_TYPE,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
+USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv' AS SOURCE_URL,'titanic' AS SOURCE_OBJ_SCHEMA,'titanic_raw' AS SOURCE_OBJ_NAME,'bronze' AS TARGET_SCHEMA,'titanic_bronze' AS TARGET_TABLE,'csv' AS FILE_FORMAT,'csv' AS INPUT_FILE_FORMAT,'FULL' AS LOAD_TYPE,',' AS DELIMETER,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
 ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE
 WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL=src.SOURCE_URL,tgt.FILE_FORMAT=src.FILE_FORMAT,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
 
--- MARAN_workspace | FINANCE_MEDALLION_L0 | [v1.0][untagged] 2026-07-06 07:35 | L0 | main
+-- ============================================================
+-- Workspace : MARAN_workspace
+-- GROUP_ID  : FINANCE_MEDALLION_L0
+-- Layers    : L0(1) L1(0) L2(0)
+-- Generated : 2026-07-10 06:09:10
+-- Bundle    : [v1.0][untagged] 2026-07-10 06:07 | L0 | main
+-- ============================================================
 
+-- control_header
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'FINANCE_MEDALLION_L0_JOB' AS JOB_NAME,'/Workspace/Repos/ma34884730@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
 ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID
 WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH=src.NOTEBOOK_PATH,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
 
+-- L0 Bronze (1 table/s)
 MERGE INTO demo_catalog.admin.data_flow_l0_detail AS tgt
-USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv' AS SOURCE_URL,'bronze' AS TARGET_SCHEMA,'titanic_bronze' AS TARGET_TABLE,'csv' AS FILE_FORMAT,'FULL' AS LOAD_TYPE,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
+USING (SELECT 'FINANCE_MEDALLION_L0' AS DATA_FLOW_GROUP_ID,'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv' AS SOURCE_URL,'titanic' AS SOURCE_OBJ_SCHEMA,'titanic_raw' AS SOURCE_OBJ_NAME,'bronze' AS TARGET_SCHEMA,'titanic_bronze' AS TARGET_TABLE,'csv' AS FILE_FORMAT,'csv' AS INPUT_FILE_FORMAT,'FULL' AS LOAD_TYPE,',' AS DELIMETER,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
 ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE
 WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL=src.SOURCE_URL,tgt.FILE_FORMAT=src.FILE_FORMAT,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
