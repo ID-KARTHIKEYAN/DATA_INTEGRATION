@@ -1,7 +1,7 @@
--- karthik_workspace | EMPLOYEE_MASTER_L0 | [v1.0][untagged] 2026-07-10 06:15 | L0 | main
+-- MARAN_workspace | EMPLOYEE_MASTER_L0 | [v1.0][untagged] 2026-07-10 06:16 | L0 | main
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
-USING (SELECT 'EMPLOYEE_MASTER_L0' AS DATA_FLOW_GROUP_ID,'EMPLOYEE_MASTER_L0_JOB' AS JOB_NAME,'/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
+USING (SELECT 'EMPLOYEE_MASTER_L0' AS DATA_FLOW_GROUP_ID,'EMPLOYEE_MASTER_L0_JOB' AS JOB_NAME,'/Workspace/Repos/ma3488473.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
 ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID
 WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH=src.NOTEBOOK_PATH,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE
 WHEN NOT MATCHED THEN INSERT *;
