@@ -33,7 +33,7 @@ pipeline {
         // ── Existing parameter ────────────────────────────────
         choice(
             name: 'WORKSPACE',
-            choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace','RAJA_2005'],
+            choices: ['ALL', 'karthik_workspace', 'MARAN_workspace', 'user3_workspace','RAJA_2005','abiram_workspace'],
             description: 'Deploy to specific workspace or ALL'
         )
 
