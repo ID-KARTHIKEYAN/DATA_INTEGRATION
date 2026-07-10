@@ -40,33 +40,7 @@
       "is_active": false
     },
         {
-      "name":       {
-        "valueCount": 1,
-        "strings":         [
-          "",
-          "_workspace"
-        ],
-        "bytes":         [
-          65,
-          66,
-          73,
-          82,
-          65,
-          77,
-          95,
-          119,
-          111,
-          114,
-          107,
-          115,
-          112,
-          97,
-          99,
-          101
-        ],
-        "values": ["ABIRAM"],
-        "empty": false
-      },
+      "name": "abiram_workspace"
       "owner": "abiram",
       "role": "intern",
       "jenkins_user": "abiram",
