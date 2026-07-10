@@ -11,8 +11,8 @@
     {
       "name"             : "karthik_workspace",
       "owner"            : "Karthick",
-      "role"             : "admin",
-      "jenkins_user"     : "DATAKALAMIT",
+      "role"             : "developer",
+      "jenkins_user"     : "karthick",
       "workspace_url"    : "https://dbc-9e0f543c-87b6.cloud.databricks.com",
       "credential_id"    : "DATABRICKS_TOKEN_KARTHIK",
       "catalog"          : "demo_catalog",
