@@ -24,7 +24,7 @@
       "name"             : "MARAN_workspace",
       "owner"            : "Maran",
       "role"             : "developer",
-      "jenkins_user"     : "MARAN",
+      "jenkins_user"     : "maran",
       "workspace_url"    : "https://dbc-9f25f8d8-b402.cloud.databricks.com",
       "credential_id"    : "DATABRICKS_TOKEN_MARAN",
       "catalog"          : "demo_catalog",
