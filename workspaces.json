@@ -41,7 +41,7 @@
       "credential_id"    : "DATABRICKS_TOKEN_RAJA",
       "catalog"          : "demo_catalog",
       "github_repo_path" : "/Workspace/Repos/raja@gmail.com/DATA_INTEGRATION",
-      "is_active"        : true
+      "is_active"        : false
     },
 
     {
