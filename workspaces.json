@@ -40,7 +40,7 @@
       "is_active": false
     },
         {
-      "name": "abiram_workspace"
+      "name": "abiram_workspace",
       "owner": "abiram",
       "role": "intern",
       "jenkins_user": "abiram",
