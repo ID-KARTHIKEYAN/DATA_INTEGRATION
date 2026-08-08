@@ -1,4 +1,4 @@
--- karthik_workspace | MASTER_DATA_L0 | [v1.0][untagged] 2026-06-26 06:11 | L0 | main
+-- karthik_workspace | MASTER_DATA_L0 | [v1.0][untagged] 2026-08-08 17:16 | L0 | main
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (SELECT 'MASTER_DATA_L0' AS DATA_FLOW_GROUP_ID,'MASTER_DATA_L0_JOB' AS JOB_NAME,'/Workspace/Users/svkarthick0@gmail.com/DATA_INTEGRATION/notebooks/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
