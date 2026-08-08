@@ -1,4 +1,4 @@
--- karthik_workspace | BANKING_L0_RAW | [v1.0][untagged] 2026-06-26 06:06 | ALL | main
+-- karthik_workspace | BANKING_L0_RAW | [v1.0][untagged] 2026-08-08 17:16 | ALL | main
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (SELECT 'BANKING_L0_RAW' AS DATA_FLOW_GROUP_ID,'BANKING_L0_RAW_JOB' AS JOB_NAME,'/Workspace/Users/svkarthick0@gmail.com/run_framework' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src
