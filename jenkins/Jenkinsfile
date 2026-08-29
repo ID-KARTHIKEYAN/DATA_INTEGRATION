@@ -414,8 +414,8 @@ pipeline {
                                     return j.result?.data_array ?: []
                                 }
 
-                                def l1 = runQ("SELECT COUNT(*),MAX(TARGET_SCHEMA) FROM ${catalog}.admin.data_flow_l1_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
-                                def l2 = runQ("SELECT COUNT(*),MAX(TARGET_SCHEMA) FROM ${catalog}.admin.data_flow_l2_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
+                                def l1 = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND ETL_LAYER='L1' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
+                                def l2 = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND ETL_LAYER='L2' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
                                 def l1c = l1 ? (l1[0][0] as int) : 0
                                 def l2c = l2 ? (l2[0][0] as int) : 0
                                 def total = l1c + l2c
