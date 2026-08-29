@@ -145,26 +145,27 @@ pipeline {
                                 return j.result?.data_array ?: []
                             }
 
-                            def hdr = runQ("SELECT DATA_FLOW_GROUP_ID, NOTEBOOK_PATH FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
+                            def hdr = runQ("SELECT DATA_FLOW_GROUP_ID, TRIGGER_TYPE, ETL_LAYER FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
                             if (hdr.isEmpty()) { echo "  ${ws.name}: no header for ${groupId}"; return }
 
-                            def det = runQ("SELECT SOURCE_URL, TARGET_SCHEMA, TARGET_TABLE, FILE_FORMAT, LOAD_TYPE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
+                            def det = runQ("SELECT SOURCE, SOURCE_OBJ_NAME, INPUT_FILE_FORMAT, STORAGE_TYPE, LOAD_TYPE FROM ${catalog}.admin.data_flow_l0_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'")
                             if (det.isEmpty()) { echo "  ${ws.name}: no detail rows"; return }
 
-                            def np = hdr[0][1]
+                            def triggerType = hdr[0][1]
+                            def etlLayer = hdr[0][2]
                             sqlLines << "-- ${ws.name} | ${groupId} | ${env.BUNDLE_INFO}"
                             sqlLines << ""
                             sqlLines << "MERGE INTO ${catalog}.admin.data_flow_control_header AS tgt"
-                            sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${groupId}_JOB' AS JOB_NAME,'${np}' AS NOTEBOOK_PATH,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
-                            sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID"
-                            sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.NOTEBOOK_PATH=src.NOTEBOOK_PATH,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
+                            sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${triggerType}' AS TRIGGER_TYPE,'${etlLayer}' AS ETL_LAYER,'Y' AS IS_ACTIVE,current_timestamp() AS INSERTED_TS,current_timestamp() AS UPDATED_TS) AS src"
+                            sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.ETL_LAYER=src.ETL_LAYER"
+                            sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.TRIGGER_TYPE=src.TRIGGER_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_TS=src.UPDATED_TS"
                             sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
                             sqlLines << ""
                             det.each { r ->
                                 sqlLines << "MERGE INTO ${catalog}.admin.data_flow_l0_detail AS tgt"
-                                sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${r[0]}' AS SOURCE_URL,'${r[1]}' AS TARGET_SCHEMA,'${r[2]}' AS TARGET_TABLE,'${r[3]}' AS FILE_FORMAT,'${r[4]}' AS LOAD_TYPE,'Y' AS IS_ACTIVE,current_timestamp() AS CREATED_DATE,current_timestamp() AS UPDATED_DATE) AS src"
-                                sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.TARGET_TABLE=src.TARGET_TABLE"
-                                sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.SOURCE_URL=src.SOURCE_URL,tgt.FILE_FORMAT=src.FILE_FORMAT,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_DATE=src.UPDATED_DATE"
+                                sqlLines << "USING (SELECT '${groupId}' AS DATA_FLOW_GROUP_ID,'${r[0]}' AS SOURCE,'${r[1]}' AS SOURCE_OBJ_NAME,'${r[2]}' AS INPUT_FILE_FORMAT,'${r[3]}' AS STORAGE_TYPE,'${r[4]}' AS LOAD_TYPE,'Y' AS IS_ACTIVE,current_timestamp() AS INSERTED_TS,current_timestamp() AS UPDATED_TS) AS src"
+                                sqlLines << "ON tgt.DATA_FLOW_GROUP_ID=src.DATA_FLOW_GROUP_ID AND tgt.SOURCE_OBJ_NAME=src.SOURCE_OBJ_NAME"
+                                sqlLines << "WHEN MATCHED THEN UPDATE SET tgt.SOURCE=src.SOURCE,tgt.INPUT_FILE_FORMAT=src.INPUT_FILE_FORMAT,tgt.STORAGE_TYPE=src.STORAGE_TYPE,tgt.LOAD_TYPE=src.LOAD_TYPE,tgt.IS_ACTIVE=src.IS_ACTIVE,tgt.UPDATED_TS=src.UPDATED_TS"
                                 sqlLines << "WHEN NOT MATCHED THEN INSERT *;"
                                 sqlLines << ""
                             }
@@ -217,8 +218,10 @@ pipeline {
                             if ((wh.warehouses ?: []).isEmpty()) { echo "  ${ws.name}: no warehouse"; tableMap[ws.name] = []; return }
                             def whId = wh.warehouses[0].id
 
-                            def detail = layer == 'L1' ? 'data_flow_l1_detail' : layer == 'L2' ? 'data_flow_l2_detail' : 'data_flow_l0_detail'
-                            def sql    = "SELECT TARGET_TABLE, TARGET_SCHEMA FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)!='VIEW' ORDER BY TARGET_TABLE"
+                            def detail = (layer == 'L1' || layer == 'L2') ? 'data_flow_pb_detail' : 'data_flow_l0_detail'
+                            def sql    = (layer == 'L0') 
+                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY SOURCE_OBJ_NAME"
+                                : "SELECT TARGET_OBJ_NAME, TARGET_OBJ_SCHEMA FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(TARGET_OBJ_TYPE)!='VIEW' ORDER BY TARGET_OBJ_NAME"
                             def p      = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
                             def tmp    = "/tmp/tbl_${System.currentTimeMillis()}.json"
                             writeFile file: tmp, text: p
@@ -229,8 +232,8 @@ pipeline {
                                     def rowJson = lines[-1] == '200' ? readJSON(text: rowBody) : [:]
                                     def rows    = rowJson.result?.data_array ?: []
                             tableMap[ws.name] = rows
-                            echo "  ${ws.name}: ${rows.size()} table(s) in ${detail}"
-                            rows.each { r -> echo "    → ${r[1]}.${r[0]}" }
+                            echo "  ${ws.name}: ${rows.size()} object(s) in ${detail}"
+                            rows.each { r -> echo "    → ${r[1] ?: 'stage'}.${r[0]}" }
                         }
                     }
                     env.TABLE_MAP = writeJSON(returnText:true, json:tableMap)
