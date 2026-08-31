@@ -220,8 +220,8 @@ pipeline {
 
                             def detail = (layer == 'L1' || layer == 'L2') ? 'data_flow_pb_detail' : 'data_flow_l0_detail'
                             def sql    = (layer == 'L0') 
-                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY SOURCE_OBJ_NAME"
-                                : "SELECT TARGET_OBJ_NAME, TARGET_OBJ_SCHEMA FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(TARGET_OBJ_TYPE)!='VIEW' ORDER BY TARGET_OBJ_NAME"
+                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA, COALESCE(PRIORITY, 999) AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY PRIORITY, SOURCE_OBJ_NAME"
+                                : "SELECT TARGET_OBJ_NAME, TARGET_OBJ_SCHEMA, COALESCE(PRIORITY, 999) AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(TARGET_OBJ_TYPE)!='VIEW' ORDER BY PRIORITY, TARGET_OBJ_NAME"
                             def p      = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
                             def tmp    = "/tmp/tbl_${System.currentTimeMillis()}.json"
                             writeFile file: tmp, text: p
@@ -233,7 +233,7 @@ pipeline {
                                     def rows    = rowJson.result?.data_array ?: []
                             tableMap[ws.name] = rows
                             echo "  ${ws.name}: ${rows.size()} object(s) in ${detail}"
-                            rows.each { r -> echo "    → ${r[1] ?: 'stage'}.${r[0]}" }
+                            rows.each { r -> echo "    → ${r[1] ?: 'stage'}.${r[0]} (priority=${r[2]})" }
                         }
                     }
                     env.TABLE_MAP = writeJSON(returnText:true, json:tableMap)
@@ -283,14 +283,45 @@ pipeline {
                                 }
 
                                 if (!existing) {
-                                    // Build tasks list — one per table
-                                    def tasks = tableRows.isEmpty()
-                                        ? [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
-                                        : tableRows.collect { r ->
-                                            def tbl = r[0]
-                                            [task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
-                                             notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:tag], source:'WORKSPACE']]
-                                          }
+                                    // Build tasks list with PRIORITY-based dependencies
+                                    def tasks = []
+                                    if (tableRows.isEmpty()) {
+                                        tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
+                                    } else {
+                                        // Group tables by priority
+                                        def priorityGroups = [:]
+                                        tableRows.each { r ->
+                                            def priority = r[2] ?: 999
+                                            if (!priorityGroups[priority]) priorityGroups[priority] = []
+                                            priorityGroups[priority] << r
+                                        }
+                                        
+                                        // Build tasks with dependencies on previous priority group
+                                        def prevPriorityTasks = []
+                                        priorityGroups.sort().each { priority, tables ->
+                                            tables.each { r ->
+                                                def tbl = r[0]
+                                                def task = [
+                                                    task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
+                                                    notebook_task: [
+                                                        notebook_path: nbPath,
+                                                        base_parameters: [GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:tag],
+                                                        source: 'WORKSPACE'
+                                                    ]
+                                                ]
+                                                
+                                                // Add dependency on ALL tasks from previous priority
+                                                if (!prevPriorityTasks.isEmpty()) {
+                                                    task.depends_on = prevPriorityTasks.collect { [task_key: it] }
+                                                }
+                                                
+                                                tasks << task
+                                            }
+                                            
+                                            // Save current priority tasks for next iteration
+                                            prevPriorityTasks = tables.collect { it[0].replaceAll('[^a-zA-Z0-9_]','_') }
+                                        }
+                                    }
 
                                     def jp  = writeJSON(returnText:true, json:[
                                         name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
@@ -307,7 +338,10 @@ pipeline {
                                     def cjson = readJSON text: lines[0..-2].join('\n')
                                     wsLocal.job_id = cjson.job_id
                                     echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
-                                    tasks.each { t -> echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'}" }
+                                    tasks.each { t -> 
+                                        def deps = t.depends_on ? "[deps: ${t.depends_on.collect{it.task_key}.join(',')}]" : "[no deps]"
+                                        echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'} ${deps}" 
+                                    }
                                 }
                             }
                         }
