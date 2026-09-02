@@ -12,7 +12,7 @@ pipeline {
         string(name: 'VERSION',    defaultValue: '1.0', description: 'Pipeline version')
         booleanParam(name: 'SYNC_GIT',            defaultValue: true,  description: 'Sync GitHub repo')
         booleanParam(name: 'SYNC_TABLES_TO_GITHUB', defaultValue: true, description: 'Push SQL to META_STORE_SQL_SCRIPTS/')
-        booleanParam(name: 'CREATE_JOBS',          defaultValue: true,  description: 'Create/verify Databricks jobs')
+        booleanParam(name: 'CREATE_JOBS',          defaultValue: true,  description: 'Create/verify Databricks jobs or DLT pipelines')
         booleanParam(name: 'WAIT_FOR_COMPLETION',  defaultValue: true,  description: 'Wait for job completion')
     }
 
@@ -56,13 +56,9 @@ pipeline {
         }
 
         // ── STAGE 3 : LOAD REGISTRY (auto-detects workspace) ──
-        // No manual WORKSPACE selection needed.
-        // Jenkins username → matched to jenkins_user in workspaces.json
-        // Admin (DATAKALAMIT / no mapping) → all active workspaces
         stage('Load Registry') {
             steps {
                 script {
-                    // Get Jenkins username who clicked Build
                     def buildUser = currentBuild
                         .getBuildCauses('hudson.model.Cause$UserIdCause')
                         .collect { it?.userId }
@@ -74,13 +70,11 @@ pipeline {
                     def wsRaw = readFile('workspaces.json')
                     def reg   = readJSON text: wsRaw
 
-                    // Match by jenkins_user field
                     def sel = reg.workspaces.findAll { ws ->
                         ws.is_active == true && ws.jenkins_user == buildUser
                     }
 
                     if (sel.isEmpty()) {
-                        // No mapping found — admin mode: use all active workspaces
                         echo "No mapping for '${buildUser}' — admin mode: all active workspaces"
                         sel = reg.workspaces.findAll { it.is_active == true }
                     }
@@ -200,8 +194,51 @@ pipeline {
             }
         }
 
-        // ── STAGE 5a : QUERY CONTROL TABLE ──────────────────
-        // Separate from job creation to reduce method size
+        // ── STAGE 5a : QUERY CONTROL TABLE (TRIGGER_TYPE) ────
+        stage('Load Trigger Type') {
+            when { expression { params.CREATE_JOBS } }
+            steps {
+                script {
+                    def wsList  = readJSON text: env.SELECTED_WORKSPACES
+                    def groupId = params.GROUP_ID.trim().toUpperCase()
+                    def triggerMap = [:]   // wsName → TRIGGER_TYPE (JOB or DLT)
+
+                    wsList.each { ws ->
+                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+                            def catalog = ws.catalog ?: 'demo_catalog'
+                            def wh = readJSON text: sh(returnStdout:true, script:"curl -s '${ws.workspace_url}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                            if ((wh.warehouses ?: []).isEmpty()) { 
+                                echo "  ${ws.name}: no warehouse (default to JOB)"
+                                triggerMap[ws.name] = 'JOB'
+                                return 
+                            }
+                            def whId = wh.warehouses[0].id
+
+                            def sql = "SELECT TRIGGER_TYPE FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' LIMIT 1"
+                            def p = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
+                            def tmp = "/tmp/ttype_${System.currentTimeMillis()}.json"
+                            writeFile file: tmp, text: p
+                            def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${ws.workspace_url}/api/2.0/sql/statements' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tmp}").trim()
+                            sh "rm -f ${tmp}"
+                            def lines = raw.split('\n')
+                            def triggerType = 'JOB'  // default
+                            if (lines[-1] == '200') {
+                                def j = readJSON text: lines[0..-2].join('\n')
+                                def rows = j.result?.data_array ?: []
+                                if (!rows.isEmpty()) {
+                                    triggerType = (rows[0][0] ?: 'JOB').toUpperCase().trim()
+                                }
+                            }
+                            triggerMap[ws.name] = triggerType
+                            echo "  ${ws.name}: TRIGGER_TYPE = ${triggerType}"
+                        }
+                    }
+                    env.TRIGGER_MAP = writeJSON(returnText:true, json:triggerMap)
+                }
+            }
+        }
+
+        // ── STAGE 5b : QUERY TABLE CONFIG ───────────────────
         stage('Load Table Config') {
             when { expression { params.CREATE_JOBS } }
             steps {
@@ -229,8 +266,8 @@ pipeline {
                             sh "rm -f ${tmp}"
                             def lines = raw.split('\n')
                             def rowBody = lines[0..-2].join('\n')
-                                    def rowJson = lines[-1] == '200' ? readJSON(text: rowBody) : [:]
-                                    def rows    = rowJson.result?.data_array ?: []
+                            def rowJson = lines[-1] == '200' ? readJSON(text: rowBody) : [:]
+                            def rows    = rowJson.result?.data_array ?: []
                             tableMap[ws.name] = rows
                             echo "  ${ws.name}: ${rows.size()} object(s) in ${detail}"
                             rows.each { r -> echo "    → ${r[1] ?: 'stage'}.${r[0]} (priority=${r[2]})" }
@@ -241,12 +278,13 @@ pipeline {
             }
         }
 
-        // ── STAGE 5b : CREATE / VERIFY JOBS ─────────────────
-        stage('Create Jobs') {
+        // ── STAGE 5c : CREATE JOBS / DLT PIPELINES ──────────
+        stage('Create Jobs/Pipelines') {
             when { expression { params.CREATE_JOBS } }
             steps {
                 script {
                     def wsList      = readJSON text: env.SELECTED_WORKSPACES
+                    def triggerMap  = readJSON text: env.TRIGGER_MAP
                     def tableMap    = readJSON text: env.TABLE_MAP
                     def groupId     = params.GROUP_ID.trim().toUpperCase()
                     def tag         = params.BUNDLE_TAG?.trim() ?: 'untagged'
@@ -254,93 +292,135 @@ pipeline {
 
                     wsList.each { ws ->
                         def wsLocal = ws
+                        def triggerType = triggerMap[wsLocal.name] ?: 'JOB'
                         parallelMap[wsLocal.name] = {
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
-                                def jobName    = "DBX_${groupId}_JOB"
-                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/run_framework"
+                                def catalog = wsLocal.catalog ?: 'demo_catalog'
+                                def namePrefix = "DBX_${groupId}"
+                                def nbPath     = env.DETECTED_LAYER == 'L0' ? "${wsLocal.github_repo_path}/notebooks/L0_DATA_INGESTION" : "${wsLocal.github_repo_path}/notebooks/L1_TRANSFORMATION"
                                 def tableRows  = tableMap[wsLocal.name] ?: []
-                                def expTasks   = tableRows.isEmpty() ? 1 : tableRows.size()
 
-                                // Check existing job
-                                def listJson   = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
-                                def existing   = listJson.jobs?.find { it.settings?.name == jobName }
+                                if (triggerType == 'DLT') {
+                                    // ═══ CREATE DLT PIPELINE ═══
+                                    def pipelineName = "${namePrefix}_DLT_PIPELINE"
+                                    def listJson   = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.1/pipelines?max_results=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                                    def existing   = listJson.pipelines?.find { it.name == pipelineName }
 
-                                if (existing) {
-                                    def curTasks = existing.settings?.tasks?.size() ?: 1
-                                    if (curTasks == expTasks) {
-                                        wsLocal.job_id = existing.job_id
-                                        echo "  ${jobName} ✅ exists | tasks=${curTasks}"
+                                    if (existing) {
+                                        wsLocal.pipeline_id = existing.pipeline_id
+                                        echo "  ${pipelineName} ✅ exists | id=${wsLocal.pipeline_id}"
                                     } else {
-                                        // Delete stale job
-                                        def dt = writeJSON(returnText:true, json:[job_id: existing.job_id])
-                                        def df = "/tmp/del_${System.currentTimeMillis()}.json"
-                                        writeFile file: df, text: dt
-                                        sh "curl -s -X POST '${wsLocal.workspace_url}/api/2.1/jobs/delete' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${df}"
+                                        def dltConfig = [
+                                            name: pipelineName,
+                                            storage: "/Volumes/${catalog}/bronze/dlt_storage",
+                                            catalog: catalog,
+                                            target: "silver",
+                                            channel: "PREVIEW",
+                                            edition: "PRO",
+                                            photon: true,
+                                            continuous: true,
+                                            development: false,
+                                            configurations: [GROUP_ID: groupId, ENVIRONMENT: tag],
+                                            clusters: [[num_workers: 1, node_type_id: "i3.xlarge"]],
+                                            libraries: [[notebook: [path: nbPath]]]
+                                        ]
+                                        def dp  = writeJSON(returnText:true, json:dltConfig)
+                                        def df  = "/tmp/dlt_${System.currentTimeMillis()}.json"
+                                        writeFile file: df, text: dp
+                                        def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/pipelines' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${df}").trim()
                                         sh "rm -f ${df}"
-                                        echo "  ${jobName} outdated (${curTasks}→${expTasks} tasks) — deleted"
-                                        existing = null
+                                        def lines = raw.split('\n')
+                                        if (lines[-1] != '200') error "DLT create failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
+                                        def cjson = readJSON text: lines[0..-2].join('\n')
+                                        wsLocal.pipeline_id = cjson.pipeline_id
+                                        echo "  ${pipelineName} created | pipeline_id=${wsLocal.pipeline_id}"
                                     }
-                                }
+                                } else {
+                                    // ═══ CREATE REGULAR JOB ═══
+                                    def jobName    = "${namePrefix}_JOB"
+                                    def expTasks   = tableRows.isEmpty() ? 1 : tableRows.size()
 
-                                if (!existing) {
-                                    // Build tasks list with PRIORITY-based dependencies
-                                    def tasks = []
-                                    if (tableRows.isEmpty()) {
-                                        tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
-                                    } else {
-                                        // Group tables by priority
-                                        def priorityGroups = [:]
-                                        tableRows.each { r ->
-                                            def priority = r[2] ?: 999
-                                            if (!priorityGroups[priority]) priorityGroups[priority] = []
-                                            priorityGroups[priority] << r
+                                    // Check existing job
+                                    def listJson   = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                                    def existing   = listJson.jobs?.find { it.settings?.name == jobName }
+
+                                    if (existing) {
+                                        def curTasks = existing.settings?.tasks?.size() ?: 1
+                                        if (curTasks == expTasks) {
+                                            wsLocal.job_id = existing.job_id
+                                            echo "  ${jobName} ✅ exists | tasks=${curTasks}"
+                                        } else {
+                                            // Delete stale job
+                                            def dt = writeJSON(returnText:true, json:[job_id: existing.job_id])
+                                            def df = "/tmp/del_${System.currentTimeMillis()}.json"
+                                            writeFile file: df, text: dt
+                                            sh "curl -s -X POST '${wsLocal.workspace_url}/api/2.1/jobs/delete' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${df}"
+                                            sh "rm -f ${df}"
+                                            echo "  ${jobName} outdated (${curTasks}→${expTasks} tasks) — deleted"
+                                            existing = null
                                         }
-                                        
-                                        // Build tasks with dependencies on previous priority group
-                                        def prevPriorityTasks = []
-                                        priorityGroups.sort().each { priority, tables ->
-                                            tables.each { r ->
-                                                def tbl = r[0]
-                                                def task = [
-                                                    task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
-                                                    notebook_task: [
-                                                        notebook_path: nbPath,
-                                                        base_parameters: [GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:tag],
-                                                        source: 'WORKSPACE'
-                                                    ]
-                                                ]
-                                                
-                                                // Add dependency on ALL tasks from previous priority
-                                                if (!prevPriorityTasks.isEmpty()) {
-                                                    task.depends_on = prevPriorityTasks.collect { [task_key: it] }
-                                                }
-                                                
-                                                tasks << task
+                                    }
+
+                                    if (!existing) {
+                                        // Build tasks list with PRIORITY-based dependencies
+                                        def tasks = []
+                                        if (tableRows.isEmpty()) {
+                                            tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
+                                        } else {
+                                            // Group tables by priority
+                                            def priorityGroups = [:]
+                                            tableRows.each { r ->
+                                                def priority = r[2] ?: 999
+                                                if (!priorityGroups[priority]) priorityGroups[priority] = []
+                                                priorityGroups[priority] << r
                                             }
                                             
-                                            // Save current priority tasks for next iteration
-                                            prevPriorityTasks = tables.collect { it[0].replaceAll('[^a-zA-Z0-9_]','_') }
+                                            // Build tasks with dependencies on previous priority group
+                                            def prevPriorityTasks = []
+                                            priorityGroups.sort().each { priority, tables ->
+                                                tables.each { r ->
+                                                    def tbl = r[0]
+                                                    def task = [
+                                                        task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
+                                                        notebook_task: [
+                                                            notebook_path: nbPath,
+                                                            base_parameters: [GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:tag],
+                                                            source: 'WORKSPACE'
+                                                        ]
+                                                    ]
+                                                    
+                                                    // Add dependency on ALL tasks from previous priority
+                                                    if (!prevPriorityTasks.isEmpty()) {
+                                                        task.depends_on = prevPriorityTasks.collect { [task_key: it] }
+                                                    }
+                                                    
+                                                    tasks << task
+                                                }
+                                                
+                                                // Save current priority tasks for next iteration
+                                                prevPriorityTasks = tables.collect { it[0].replaceAll('[^a-zA-Z0-9_]','_') }
+                                            }
                                         }
-                                    }
 
-                                    def jp  = writeJSON(returnText:true, json:[
-                                        name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
-                                        max_concurrent_runs:1,
-                                        parameters:[[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
-                                        tasks:tasks
-                                    ])
-                                    def jf  = "/tmp/job_${System.currentTimeMillis()}.json"
-                                    writeFile file:jf, text:jp
-                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${jf}").trim()
-                                    sh "rm -f ${jf}"
-                                    def lines = raw.split('\n')
-                                    if (lines[-1] != '200') error "Job create failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
-                                    def cjson = readJSON text: lines[0..-2].join('\n')
-                                    wsLocal.job_id = cjson.job_id
-                                    echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
-                                    tasks.each { t -> 
-                                        def deps = t.depends_on ? "[deps: ${t.depends_on.collect{it.task_key}.join(',')}]" : "[no deps]"
-                                        echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'} ${deps}" 
+                                        def jp  = writeJSON(returnText:true, json:[
+                                            name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
+                                            max_concurrent_runs:1,
+                                            parameters:[[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
+                                            tasks:tasks
+                                        ])
+                                        def jf  = "/tmp/job_${System.currentTimeMillis()}.json"
+                                        writeFile file:jf, text:jp
+                                        def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${jf}").trim()
+                                        sh "rm -f ${jf}"
+                                        def lines = raw.split('\n')
+                                        if (lines[-1] != '200') error "Job create failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
+                                        def cjson = readJSON text: lines[0..-2].join('\n')
+                                        wsLocal.job_id = cjson.job_id
+                                        echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
+                                        tasks.each { t -> 
+                                            def deps = t.depends_on ? "[deps: ${t.depends_on.collect{it.task_key}.join(',')}]" : "[no deps]"
+                                            echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'} ${deps}" 
+                                        }
                                     }
                                 }
                             }
@@ -353,28 +433,43 @@ pipeline {
         }
 
         // ── STAGE 6 : TRIGGER ───────────────────────────────
-        stage('Trigger Jobs') {
+        stage('Trigger Jobs/Pipelines') {
             steps {
                 script {
                     def wsList  = readJSON text: env.SELECTED_WORKSPACES
+                    def triggerMap = readJSON text: env.TRIGGER_MAP
                     def groupId = params.GROUP_ID.trim().toUpperCase()
                     def runIds  = [:]
                     def pMap    = [:]
 
                     wsList.each { ws ->
+                        def triggerType = triggerMap[ws.name] ?: 'JOB'
                         pMap[ws.name] = {
                             withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
-                                def tp  = writeJSON(returnText:true, json:[job_id:ws.job_id, job_parameters:[GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER]])
-                                def tf  = "/tmp/trig_${System.currentTimeMillis()}.json"
-                                writeFile file:tf, text:tp
-                                def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${ws.workspace_url}/api/2.1/jobs/run-now' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tf}").trim()
-                                sh "rm -f ${tf}"
-                                def lines = raw.split('\n')
-                                if (lines[-1] != '200') error "Trigger failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
-                                def rjson = readJSON text: lines[0..-2].join('\n')
-                                def runId = rjson.run_id
-                                runIds[ws.name] = [run_id:runId, workspace_url:ws.workspace_url, credential_id:ws.credential_id]
-                                echo "  ${ws.name} triggered | run_id=${runId}"
+                                if (triggerType == 'DLT') {
+                                    // TRIGGER DLT PIPELINE
+                                    def pipelineId = ws.pipeline_id
+                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${ws.workspace_url}/api/2.1/pipelines/${pipelineId}/updates' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d '{}'").trim()
+                                    def lines = raw.split('\n')
+                                    if (lines[-1] != '200') error "DLT trigger failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
+                                    def rjson = readJSON text: lines[0..-2].join('\n')
+                                    def updateId = rjson.update_id
+                                    runIds[ws.name] = [update_id:updateId, pipeline_id:pipelineId, workspace_url:ws.workspace_url, credential_id:ws.credential_id, is_dlt:true]
+                                    echo "  ${ws.name} DLT triggered | update_id=${updateId}"
+                                } else {
+                                    // TRIGGER REGULAR JOB
+                                    def tp  = writeJSON(returnText:true, json:[job_id:ws.job_id, job_parameters:[GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER]])
+                                    def tf  = "/tmp/trig_${System.currentTimeMillis()}.json"
+                                    writeFile file:tf, text:tp
+                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${ws.workspace_url}/api/2.1/jobs/run-now' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tf}").trim()
+                                    sh "rm -f ${tf}"
+                                    def lines = raw.split('\n')
+                                    if (lines[-1] != '200') error "Trigger failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
+                                    def rjson = readJSON text: lines[0..-2].join('\n')
+                                    def runId = rjson.run_id
+                                    runIds[ws.name] = [run_id:runId, workspace_url:ws.workspace_url, credential_id:ws.credential_id, is_dlt:false]
+                                    echo "  ${ws.name} Job triggered | run_id=${runId}"
+                                }
                             }
                         }
                     }
@@ -395,21 +490,41 @@ pipeline {
 
                     runIds.each { wsName, info ->
                         withCredentials([string(credentialsId: info.credential_id, variable: 'DB_TOKEN')]) {
-                            def elapsed = 0
-                            def done    = false
-                            def lc = ''; def rs = ''
-                            while (!done && elapsed < Integer.parseInt(env.MAX_WAIT_SECS)) {
-                                sleep(Integer.parseInt(env.POLL_INTERVAL))
-                                elapsed += Integer.parseInt(env.POLL_INTERVAL)
-                                def p    = readJSON text: sh(returnStdout:true, script:"curl -s '${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
-                                lc       = p.state?.life_cycle_state ?: 'UNKNOWN'
-                                rs       = p.state?.result_state     ?: ''
-                                echo "${wsName} | ${lc} | ${rs}"
-                                if (['TERMINATED','SKIPPED','INTERNAL_ERROR'].contains(lc)) done = true
+                            if (info.is_dlt) {
+                                // WAIT FOR DLT UPDATE
+                                def elapsed = 0
+                                def done    = false
+                                def lc = ''; def rs = ''
+                                while (!done && elapsed < Integer.parseInt(env.MAX_WAIT_SECS)) {
+                                    sleep(Integer.parseInt(env.POLL_INTERVAL))
+                                    elapsed += Integer.parseInt(env.POLL_INTERVAL)
+                                    def p    = readJSON text: sh(returnStdout:true, script:"curl -s '${info.workspace_url}/api/2.1/pipelines/${info.pipeline_id}/updates/${info.update_id}' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                                    lc       = p.update?.state ?: 'UNKNOWN'
+                                    rs       = p.update?.state ?: ''
+                                    echo "${wsName} DLT | ${lc}"
+                                    if (['COMPLETED','FAILED','STOPPED'].contains(lc)) done = true
+                                }
+                                if (!done)        { failedList << "${wsName}(TIMEOUT)"; allPassed = false }
+                                else if (lc != 'COMPLETED') { failedList << "${wsName}(${lc})"; allPassed = false }
+                                else echo "${wsName} DLT — SUCCESS"
+                            } else {
+                                // WAIT FOR JOB
+                                def elapsed = 0
+                                def done    = false
+                                def lc = ''; def rs = ''
+                                while (!done && elapsed < Integer.parseInt(env.MAX_WAIT_SECS)) {
+                                    sleep(Integer.parseInt(env.POLL_INTERVAL))
+                                    elapsed += Integer.parseInt(env.POLL_INTERVAL)
+                                    def p    = readJSON text: sh(returnStdout:true, script:"curl -s '${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                                    lc       = p.state?.life_cycle_state ?: 'UNKNOWN'
+                                    rs       = p.state?.result_state     ?: ''
+                                    echo "${wsName} Job | ${lc} | ${rs}"
+                                    if (['TERMINATED','SKIPPED','INTERNAL_ERROR'].contains(lc)) done = true
+                                }
+                                if (!done)        { failedList << "${wsName}(TIMEOUT)"; allPassed = false }
+                                else if (rs != 'SUCCESS') { failedList << "${wsName}(${rs})"; allPassed = false }
+                                else echo "${wsName} Job — SUCCESS"
                             }
-                            if (!done)        { failedList << "${wsName}(TIMEOUT)"; allPassed = false }
-                            else if (rs != 'SUCCESS') { failedList << "${wsName}(${rs})"; allPassed = false }
-                            else echo "${wsName} — SUCCESS"
                         }
                     }
                     if (!allPassed) error "Failed: ${failedList.join(', ')}"
@@ -418,96 +533,27 @@ pipeline {
             }
         }
 
-        // ── STAGE 8 : TRIGGER VIEW PIPELINE ─────────────────
-        stage('Trigger View Pipeline') {
-            when { expression { currentBuild.currentResult == 'SUCCESS' } }
+        // ── STAGE 8 : FINAL SUMMARY ─────────────────────────
+        stage('Final Summary') {
+            when { expression { params.WAIT_FOR_COMPLETION } }
             steps {
                 script {
-                    def wsList  = readJSON text: env.SELECTED_WORKSPACES
-                    def groupId = params.GROUP_ID.trim().toUpperCase()
-                    def pMap    = [:]
-
-                    wsList.each { ws ->
-                        def wsLocal = ws
-                        pMap[wsLocal.name] = {
-                            withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
-                                def catalog = wsLocal.catalog ?: 'demo_catalog'
-                                def wh = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
-                                if ((wh.warehouses ?: []).isEmpty()) { echo "  ${wsLocal.name}: no warehouse — skip"; return }
-                                def whId = wh.warehouses[0].id
-
-                                def runQ = { String sql ->
-                                    def p   = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
-                                    def tmp = "/tmp/vq_${System.currentTimeMillis()}.json"
-                                    writeFile file:tmp, text:p
-                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.0/sql/statements' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tmp}").trim()
-                                    sh "rm -f ${tmp}"
-                                    def lines = raw.split('\n')
-                                    if (lines[-1] != '200') return []
-                                    def j = readJSON text: lines[0..-2].join('\n')
-                                    return j.result?.data_array ?: []
-                                }
-
-                                def l1 = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND ETL_LAYER='L1' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
-                                def l2 = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND ETL_LAYER='L2' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
-                                def l1c = l1 ? (l1[0][0] as int) : 0
-                                def l2c = l2 ? (l2[0][0] as int) : 0
-                                def total = l1c + l2c
-
-                                echo "  ${wsLocal.name}: VIEW rows L1=${l1c} L2=${l2c}"
-                                if (total == 0) { echo "  No VIEW rows — skip"; return }
-
-                                def vLayer  = (l1c > 0 && l2c == 0) ? 'L1' : (l2c > 0 && l1c == 0) ? 'L2' : 'ALL'
-                                def tSchema = (l1c > 0 ? l1[0][1] : null) ?: (l2c > 0 ? l2[0][1] : null) ?: 'silver'
-                                def vJob    = "DBX_${groupId}_VIEW_JOB"
-                                def vPath   = "${wsLocal.github_repo_path}/notebooks/view_pipeline"
-
-                                def listJ  = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
-                                def existV = listJ.jobs?.find { it.settings?.name == vJob }
-                                def vJobId
-
-                                if (existV) {
-                                    vJobId = existV.job_id
-                                    echo "  View job exists: ${vJobId}"
-                                } else {
-                                    def vp  = writeJSON(returnText:true, json:[
-                                        name:vJob, max_concurrent_runs:1,
-                                        parameters:[[name:'GROUP_ID',default:groupId],[name:'RUN_LAYER',default:vLayer]],
-                                        tasks:[[task_key:"${vJob}_task", notebook_task:[notebook_path:vPath, base_parameters:[GROUP_ID:groupId, RUN_LAYER:vLayer], source:'WORKSPACE']]]
-                                    ])
-                                    def vf  = "/tmp/vjob_${System.currentTimeMillis()}.json"
-                                    writeFile file:vf, text:vp
-                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${vf}").trim()
-                                    sh "rm -f ${vf}"
-                                    def lines = raw.split('\n')
-                                    if (lines[-1] != '200') error "View job create HTTP ${lines[-1]}"
-                                    def vjson = readJSON text: lines[0..-2].join('\n')
-                                        vJobId = vjson.job_id
-                                    echo "  View job created: ${vJobId}"
-                                }
-
-                                def tp  = writeJSON(returnText:true, json:[job_id:vJobId, job_parameters:[GROUP_ID:groupId, RUN_LAYER:vLayer]])
-                                def tf  = "/tmp/vtrig_${System.currentTimeMillis()}.json"
-                                writeFile file:tf, text:tp
-                                def tr  = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/run-now' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tf}").trim()
-                                sh "rm -f ${tf}"
-                                def tlines = tr.split('\n')
-                                if (tlines[-1] != '200') error "View trigger HTTP ${tlines[-1]}"
-                                def trjson = readJSON text: tlines[0..-2].join('\n')
-                                def runId = trjson.run_id
-                                echo "  ${vJob} triggered | run_id=${runId} | layer=${vLayer}"
-                            }
-                        }
+                    def wsList = readJSON text: env.SELECTED_WORKSPACES
+                    def triggerMap = readJSON text: env.TRIGGER_MAP
+                    echo "✅ Pipeline execution complete for all workspaces"
+                    echo "Layer: ${env.DETECTED_LAYER} | Trigger types:"
+                    wsList.each { ws -> 
+                        def ttype = triggerMap[ws.name] ?: 'JOB'
+                        echo "  → ${ws.name} (${ttype})" 
                     }
-                    parallel pMap
                 }
             }
         }
     }
 
     post {
-        always { echo "GROUP_ID:${params.GROUP_ID} | WORKSPACE:${params.WORKSPACE_OVERRIDE} | LAYER:${env.DETECTED_LAYER} | STATUS:${currentBuild.currentResult}" }
-        success { echo "PIPELINE SUCCESS" }
-        failure { echo "PIPELINE FAILED"  }
+        always { echo "GROUP_ID:${params.GROUP_ID} | LAYER:${env.DETECTED_LAYER} | STATUS:${currentBuild.currentResult}" }
+        success { echo "✅ PIPELINE SUCCESS" }
+        failure { echo "❌ PIPELINE FAILED"  }
     }
 }
