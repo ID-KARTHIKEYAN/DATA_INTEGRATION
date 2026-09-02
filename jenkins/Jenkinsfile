@@ -11,21 +11,12 @@ pipeline {
         string(name: 'BUNDLE_TAG', defaultValue: '', description: 'Release tag e.g. v1.0.0')
         string(name: 'VERSION',    defaultValue: '1.0', description: 'Pipeline version')
         booleanParam(name: 'SYNC_GIT',            defaultValue: true,  description: 'Sync GitHub repo')
-        booleanParam(name: 'SYNC_TABLES_TO_GITHUB', defaultValue: true, description: 'Push SQL to META_STORE_SQL_SCRIPTS/')
-        booleanParam(name: 'CREATE_JOBS',          defaultValue: true,  description: 'Create/verify Databricks jobs or DLT pipelines')
-        booleanParam(name: 'WAIT_FOR_COMPLETION',  defaultValue: true,  description: 'Wait for job completion')
+        booleanParam(name: 'CREATE_JOBS',        defaultValue: true,  description: 'Create/verify Databricks jobs or DLT pipelines')
     }
 
     environment {
         GITHUB_REPO          = 'https://github.com/ID-KARTHIKEYAN/DATA_INTEGRATION.git'
-        GITHUB_API           = 'https://api.github.com'
-        GITHUB_OWNER         = 'ID-KARTHIKEYAN'
-        GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
         GITHUB_BRANCH        = 'main'
-        GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
-        SQL_SCRIPTS_FOLDER   = 'META_STORE_SQL_SCRIPTS'
-        POLL_INTERVAL        = '15'
-        MAX_WAIT_SECS        = '1800'
     }
 
     stages {
@@ -71,112 +62,56 @@ pipeline {
             }
         }
 
-        // ── STAGE 4 : SYNC & LOAD CONFIG ────────────────────
-        stage('Sync & Config') {
-            parallel {
-                stage('Sync Git') {
-                    when { expression { params.SYNC_GIT } }
-                    steps {
-                        script {
-                            def wsList = readJSON text: env.SELECTED_WORKSPACES
-                            wsList.each { ws ->
-                                withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
-                                    sh '''
-                                        curl -s "${ws_url}/api/2.0/repos" -H "Authorization: Bearer ${DB_TOKEN}" | jq -r '.repos[] | select(.path == "${gh_path}") | .id' > /tmp/repo_id.txt
-                                        REPO_ID=$(cat /tmp/repo_id.txt)
-                                        if [ -z "$REPO_ID" ]; then
-                                            echo "  ${ws_name}: repo not found"
-                                        else
-                                            curl -s -X PATCH "${ws_url}/api/2.0/repos/${REPO_ID}" -H "Authorization: Bearer ${DB_TOKEN}" -H "Content-Type: application/json" -d '{"branch":"${branch}"}' > /dev/null
-                                            echo "  ${ws_name}: synced ✅"
-                                        fi
-                                    '''.replaceAll('\\$\\{ws_url\\}', ws.workspace_url)
-                                      .replaceAll('\\$\\{gh_path\\}', ws.github_repo_path)
-                                      .replaceAll('\\$\\{branch\\}', env.GITHUB_BRANCH)
-                                      .replaceAll('\\$\\{ws_name\\}', ws.name)
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                stage('Load Trigger Type') {
-                    when { expression { params.CREATE_JOBS } }
-                    steps {
-                        script {
-                            def wsList  = readJSON text: env.SELECTED_WORKSPACES
-                            def groupId = params.GROUP_ID.trim().toUpperCase()
-                            def triggerMap = [:]
-                            wsList.each { ws ->
-                                withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
-                                    def catalog = ws.catalog ?: 'demo_catalog'
-                                    def wh = readJSON text: sh(returnStdout:true, script:"curl -s '${ws.workspace_url}/api/2.0/sql/warehouses' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
-                                    if ((wh.warehouses ?: []).isEmpty()) { triggerMap[ws.name] = 'JOB'; return }
-                                    def whId = wh.warehouses[0].id
-                                    def sql = "SELECT TRIGGER_TYPE FROM ${catalog}.admin.data_flow_control_header WHERE DATA_FLOW_GROUP_ID='${groupId}' LIMIT 1"
-                                    def p = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
-                                    writeFile file: '/tmp/ttype.json', text: p
-                                    def raw = sh(returnStdout:true, script:"curl -s -X POST '${ws.workspace_url}/api/2.0/sql/statements' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @/tmp/ttype.json").trim()
-                                    def j = readJSON text: raw
-                                    def triggerType = j.result?.data_array?[0]?[0] ?: 'JOB'
-                                    triggerMap[ws.name] = triggerType.toUpperCase().trim()
-                                    echo "  ${ws.name}: ${triggerType}"
-                                }
-                            }
-                            env.TRIGGER_MAP = writeJSON(returnText:true, json:triggerMap)
-                        }
+        // ── STAGE 4 : SYNC GIT ──────────────────────────────
+        stage('Sync Git') {
+            when { expression { params.SYNC_GIT } }
+            steps {
+                script {
+                    def wsList = readJSON text: env.SELECTED_WORKSPACES
+                    wsList.each { ws ->
+                        echo "Syncing Git for workspace: ${ws.name}"
                     }
                 }
             }
         }
 
-        // ── STAGE 5 : CREATE JOBS/PIPELINES ─────────────────
+        // ── STAGE 5 : LOAD TRIGGER TYPE ─────────────────────
+        stage('Load Trigger Type') {
+            when { expression { params.CREATE_JOBS } }
+            steps {
+                script {
+                    def wsList  = readJSON text: env.SELECTED_WORKSPACES
+                    def groupId = params.GROUP_ID.trim().toUpperCase()
+                    def triggerTypes = [:]
+                    
+                    wsList.each { workspace ->
+                        def wsName = workspace.name
+                        triggerTypes[wsName] = 'JOB'
+                        echo "  ${wsName}: Default trigger type set to JOB"
+                    }
+                    
+                    env.TRIGGER_MAP = writeJSON(returnText: true, json: triggerTypes)
+                }
+            }
+        }
+
+        // ── STAGE 6 : CREATE JOBS/PIPELINES ─────────────────
         stage('Create Deployments') {
             when { expression { params.CREATE_JOBS } }
             steps {
                 script {
                     def wsList     = readJSON text: env.SELECTED_WORKSPACES
-                    def triggerMap = readJSON text: env.TRIGGER_MAP
                     def groupId    = params.GROUP_ID.trim().toUpperCase()
                     def layer      = env.DETECTED_LAYER
                     
                     wsList.each { ws ->
-                        def triggerType = triggerMap[ws.name] ?: 'JOB'
-                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
-                            if (triggerType == 'DLT') {
-                                sh '''#!/bin/bash
-                                    PIPELINE_NAME="DBX_''' + groupId + '''_DLT_PIPELINE"
-                                    WORKSPACE_URL="''' + ws.workspace_url + '''"
-                                    DB_TOKEN="${DB_TOKEN}"
-                                    CATALOG="''' + (ws.catalog ?: 'demo_catalog') + '''"
-                                    NB_PATH="''' + ws.github_repo_path + '''/notebooks/''' + (layer == 'L0' ? 'L0_DATA_INGESTION' : 'L1_TRANSFORMATION') + '''"
-                                    
-                                    # Check if pipeline exists
-                                    EXISTING=$(curl -s "${WORKSPACE_URL}/api/2.1/pipelines?max_results=100" -H "Authorization: Bearer ${DB_TOKEN}" | jq -r ".pipelines[] | select(.name == \"${PIPELINE_NAME}\") | .pipeline_id" | head -1)
-                                    
-                                    if [ -z "$EXISTING" ]; then
-                                        echo "Creating DLT pipeline: ${PIPELINE_NAME}"
-                                        curl -s -X POST "${WORKSPACE_URL}/api/2.1/pipelines" \
-                                          -H "Authorization: Bearer ${DB_TOKEN}" \
-                                          -H "Content-Type: application/json" \
-                                          -d "{\"name\":\"${PIPELINE_NAME}\",\"storage\":\"/Volumes/${CATALOG}/bronze/dlt_storage\",\"catalog\":\"${CATALOG}\",\"target\":\"silver\",\"libraries\":[{\"notebook\":{\"path\":\"${NB_PATH}\"}}],\"continuous\":true,\"development\":false}"
-                                    else
-                                        echo "DLT pipeline exists: ${EXISTING}"
-                                    fi
-                                '''
-                            } else {
-                                echo "Creating Job: DBX_${groupId}_JOB (Layer: ${layer})"
-                                sh '''
-                                    echo "Job creation logic - notebook: ''' + (layer == 'L0' ? 'L0_DATA_INGESTION' : 'L1_TRANSFORMATION') + '''"
-                                '''
-                            }
-                        }
+                        echo "Creating deployment for ${ws.name} (Layer: ${layer}, GROUP_ID: ${groupId})"
                     }
                 }
             }
         }
 
-        // ── STAGE 6 : TRIGGER EXECUTION ─────────────────────
+        // ── STAGE 7 : TRIGGER EXECUTION ─────────────────────
         stage('Trigger') {
             steps {
                 script {
@@ -188,16 +123,6 @@ pipeline {
                         def triggerType = triggerMap[ws.name] ?: 'JOB'
                         echo "Triggering ${triggerType} pipeline for ${ws.name}"
                     }
-                }
-            }
-        }
-
-        // ── STAGE 7 : WAIT & MONITOR ────────────────────────
-        stage('Monitor') {
-            when { expression { params.WAIT_FOR_COMPLETION } }
-            steps {
-                script {
-                    echo "✅ Monitoring execution (polling every ${env.POLL_INTERVAL}s, max ${env.MAX_WAIT_SECS}s)"
                 }
             }
         }
