@@ -103,9 +103,64 @@ pipeline {
                     def wsList     = readJSON text: env.SELECTED_WORKSPACES
                     def groupId    = params.GROUP_ID.trim().toUpperCase()
                     def layer      = env.DETECTED_LAYER
+                    def notebookPath = layer == 'L0' ? 'L0_DATA_INGESTION' : 'L1_TRANSFORMATION'
                     
                     wsList.each { ws ->
-                        echo "Creating deployment for ${ws.name} (Layer: ${layer}, GROUP_ID: ${groupId})"
+                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+                            def jobName = "DBX_${groupId}_JOB"
+                            def wsUrl = ws.workspace_url
+                            
+                            // Check if job exists
+                            def listJobsCmd = """
+                                curl -s -X GET '${wsUrl}/api/2.1/jobs/list?name=${jobName}' \\
+                                  -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                  -H 'Content-Type: application/json'
+                            """
+                            def jobsResponse = sh(returnStdout: true, script: listJobsCmd).trim()
+                            def jobsJson = readJSON text: (jobsResponse.isEmpty() ? '{"jobs":[]}' : jobsResponse)
+                            def existingJob = jobsJson.jobs?.find { it.settings?.name == jobName }
+                            
+                            if (existingJob) {
+                                echo "✅ Job exists: ${jobName} (ID: ${existingJob.job_id})"
+                                env.JOB_ID = existingJob.job_id.toString()
+                            } else {
+                                echo "Creating job: ${jobName}"
+                                def jobConfig = [
+                                    name: jobName,
+                                    tasks: [[
+                                        task_key: groupId,
+                                        notebook_task: [
+                                            notebook_path: "/Repos/${ws.github_repo_path}/notebooks/${notebookPath}",
+                                            base_parameters: [GROUP_ID: groupId]
+                                        ],
+                                        new_cluster: [
+                                            spark_version: "13.3.x-scala2.12",
+                                            node_type_id: "i3.xlarge",
+                                            num_workers: 2,
+                                            aws_attributes: [availability: "SPOT_WITH_FALLBACK"]
+                                        ]
+                                    ]],
+                                    timeout_seconds: 86400
+                                ]
+                                
+                                def jobConfigJson = writeJSON(returnText: true, json: jobConfig)
+                                def createJobCmd = """
+                                    curl -s -X POST '${wsUrl}/api/2.1/jobs/create' \\
+                                      -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                      -H 'Content-Type: application/json' \\
+                                      -d '${jobConfigJson}'
+                                """
+                                def createResponse = sh(returnStdout: true, script: createJobCmd).trim()
+                                def createJson = readJSON text: (createResponse.isEmpty() ? '{}' : createResponse)
+                                
+                                if (createJson.job_id) {
+                                    echo "✅ Job created: ${jobName} (ID: ${createJson.job_id})"
+                                    env.JOB_ID = createJson.job_id.toString()
+                                } else {
+                                    echo "❌ Failed to create job: ${createResponse}"
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -116,12 +171,31 @@ pipeline {
             steps {
                 script {
                     def wsList     = readJSON text: env.SELECTED_WORKSPACES
-                    def triggerMap = readJSON text: env.TRIGGER_MAP
                     def groupId    = params.GROUP_ID.trim().toUpperCase()
                     
                     wsList.each { ws ->
-                        def triggerType = triggerMap[ws.name] ?: 'JOB'
-                        echo "Triggering ${triggerType} pipeline for ${ws.name}"
+                        withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+                            if (env.JOB_ID) {
+                                def wsUrl = ws.workspace_url
+                                def runJobCmd = """
+                                    curl -s -X POST '${wsUrl}/api/2.1/jobs/run-now' \\
+                                      -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                      -H 'Content-Type: application/json' \\
+                                      -d '{"job_id": ${env.JOB_ID}}'
+                                """
+                                def runResponse = sh(returnStdout: true, script: runJobCmd).trim()
+                                def runJson = readJSON text: (runResponse.isEmpty() ? '{}' : runResponse)
+                                
+                                if (runJson.run_id) {
+                                    echo "✅ Job triggered: ${groupId} (Run ID: ${runJson.run_id})"
+                                    env.RUN_ID = runJson.run_id.toString()
+                                } else {
+                                    echo "❌ Failed to trigger job: ${runResponse}"
+                                }
+                            } else {
+                                echo "⚠️ No job ID found, skipping trigger"
+                            }
+                        }
                     }
                 }
             }
@@ -132,11 +206,12 @@ pipeline {
             steps {
                 script {
                     def wsList = readJSON text: env.SELECTED_WORKSPACES
-                    def triggerMap = readJSON text: env.TRIGGER_MAP
                     echo "✅ Execution complete"
                     echo "Layer: ${env.DETECTED_LAYER}"
+                    echo "Job ID: ${env.JOB_ID ?: 'Not created'}"
+                    echo "Run ID: ${env.RUN_ID ?: 'Not triggered'}"
                     wsList.each { ws ->
-                        echo "  ✓ ${ws.name} (${triggerMap[ws.name] ?: 'JOB'})"
+                        echo "  ✓ ${ws.name}"
                     }
                 }
             }
