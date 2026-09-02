@@ -130,7 +130,7 @@ pipeline {
                                     tasks: [[
                                         task_key: groupId,
                                         notebook_task: [
-                                            notebook_path: "/Repos/${ws.github_repo_path}/notebooks/${notebookPath}",
+                                            notebook_path: "${ws.github_repo_path}/notebooks/${notebookPath}",
                                             base_parameters: [GROUP_ID: groupId]
                                         ]
                                     ]],
