@@ -267,11 +267,12 @@ pipeline {
 
                                 if (existing) {
                                     def curTasks = existing.settings?.tasks?.size() ?: 1
-                                    if (curTasks == expTasks) {
+                                    def usesNotebookTasks = existing.settings?.tasks?.every { it.notebook_task != null }
+                                    if (curTasks == expTasks && usesNotebookTasks) {
                                         wsLocal.job_id = existing.job_id
                                         echo "  ${jobName} ✅ exists | tasks=${curTasks}"
                                     } else {
-                                        // Delete stale job
+                                        // Recreate stale or legacy Python-task jobs with notebook tasks.
                                         def dt = writeJSON(returnText:true, json:[job_id: existing.job_id])
                                         def df = "/tmp/del_${System.currentTimeMillis()}.json"
                                         writeFile file: df, text: dt
