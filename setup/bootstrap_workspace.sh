@@ -115,18 +115,17 @@ JOB_JSON=$(cat <<ENDJOB
     "tasks": [
         {
             "task_key": "run_framework",
+            "environment_key": "default_env",
             "spark_python_task": {
                 "python_file": "${REPO_PATH}/notebooks/run_framework.py",
                 "parameters": ["{{job.parameters.GROUP_ID}}", "{{job.parameters.RUN_LAYER}}", "", "${CATALOG}"]
-            },
-            "new_cluster": {
-                "spark_version": "14.3.x-scala2.12",
-                "node_type_id": "i3.xlarge",
-                "num_workers": 1,
-                "spark_conf": {
-                    "spark.databricks.delta.preview.enabled": "true"
-                }
             }
+        }
+    ],
+    "environments": [
+        {
+            "environment_key": "default_env",
+            "spec": {"environment_version": "3"}
         }
     ]
 }

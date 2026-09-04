@@ -286,7 +286,7 @@ pipeline {
                                     // Build tasks list with PRIORITY-based dependencies
                                     def tasks = []
                                     if (tableRows.isEmpty()) {
-                                        tasks = [[task_key:"${groupId}_task", spark_python_task:[python_file:nbPath, parameters:[groupId, env.DETECTED_LAYER, '', wsLocal.catalog ?: 'demo_catalog']]]]
+                                        tasks = [[task_key:"${groupId}_task", spark_python_task:[python_file:nbPath, parameters:[groupId, env.DETECTED_LAYER, '', wsLocal.catalog ?: 'demo_catalog']], environment_key:'default_env']]
                                     } else {
                                         // Group tables by priority
                                         def priorityGroups = [:]
@@ -306,7 +306,8 @@ pipeline {
                                                     spark_python_task: [
                                                         python_file: nbPath,
                                                         parameters: [groupId, env.DETECTED_LAYER, "${groupId}|${env.DETECTED_LAYER}|${r[1]}|${r[0]}", wsLocal.catalog ?: 'demo_catalog']
-                                                    ]
+                                                    ],
+                                                    environment_key: 'default_env'
                                                 ]
                                                 
                                                 // Add dependency on ALL tasks from previous priority
@@ -326,7 +327,8 @@ pipeline {
                                         name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
                                         max_concurrent_runs:1,
                                         parameters:[[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
-                                        tasks:tasks
+                                        tasks:tasks,
+                                        environments:[[environment_key:'default_env',spec:[environment_version:'3']]]
                                     ])
                                     def jf  = "/tmp/job_${System.currentTimeMillis()}.json"
                                     writeFile file:jf, text:jp
