@@ -1,4 +1,4 @@
--- karthik_workspace | EMPLOYEE_MASTER_L0 | [v1.0][untagged] 2026-09-04 07:47 | L0 | feature/metadata-etl-framework
+-- karthik_workspace | EMPLOYEE_MASTER_L0 | [v1.0][untagged] 2026-09-04 07:50 | L0 | feature/metadata-etl-framework
 
 MERGE INTO demo_catalog.admin.data_flow_control_header AS tgt
 USING (SELECT 'EMPLOYEE_MASTER_L0' AS DATA_FLOW_GROUP_ID,'DLT' AS TRIGGER_TYPE,'L0' AS ETL_LAYER,'Y' AS IS_ACTIVE,current_timestamp() AS INSERTED_TS,current_timestamp() AS UPDATED_TS) AS src
