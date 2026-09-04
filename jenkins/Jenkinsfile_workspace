@@ -1,0 +1,348 @@
+// ============================================================
+// Jenkinsfile_workspace
+// WORKSPACE-MANAGEMENT-PIPELINE
+// ============================================================
+// Manages workspaces.json — add / deactivate / list members.
+// Runs as admin only. Pushes changes to GitHub automatically.
+// No manual JSON editing needed.
+// ============================================================
+
+pipeline {
+
+    agent any
+
+    parameters {
+
+        choice(
+            name: 'ACTION',
+            choices: ['LIST', 'ADD', 'DEACTIVATE', 'ACTIVATE'],
+            description: 'What to do:\n  LIST       — show all current workspace entries\n  ADD        — add a new team member\n  DEACTIVATE — disable a member (is_active=false)\n  ACTIVATE   — re-enable a member'
+        )
+
+        // ── ADD fields ────────────────────────────────────────
+        string(
+            name: 'MEMBER_NAME',
+            defaultValue: '',
+            description: 'ADD: Full name of the person  e.g. John Smith'
+        )
+
+        string(
+            name: 'JENKINS_USER',
+            defaultValue: '',
+            description: 'ADD: Jenkins login username (case-sensitive)  e.g. JOHN_2025'
+        )
+
+        string(
+            name: 'WORKSPACE_URL',
+            defaultValue: '',
+            description: 'ADD: Databricks workspace URL  e.g. https://dbc-XXXX.cloud.databricks.com'
+        )
+
+        string(
+            name: 'CREDENTIAL_ID',
+            defaultValue: '',
+            description: 'ADD: Jenkins Secret Text credential ID  e.g. DATABRICKS_TOKEN_JOHN'
+        )
+
+        string(
+            name: 'GITHUB_REPO_PATH',
+            defaultValue: '',
+            description: 'ADD: Databricks repo path  e.g. /Workspace/Repos/john@gmail.com/DATA_INTEGRATION'
+        )
+
+        choice(
+            name: 'ROLE',
+            choices: ['intern', 'developer', 'admin'],
+            description: 'ADD: Role of the new member'
+        )
+
+        string(
+            name: 'CATALOG',
+            defaultValue: 'demo_catalog',
+            description: 'ADD: Catalog name (default: demo_catalog)'
+        )
+
+        // ── DEACTIVATE / ACTIVATE field ───────────────────────
+        string(
+            name: 'TARGET_JENKINS_USER',
+            defaultValue: '',
+            description: 'DEACTIVATE/ACTIVATE: Jenkins username of the member to change'
+        )
+    }
+
+    environment {
+        GITHUB_API         = 'https://api.github.com'
+        GITHUB_OWNER       = 'ID-KARTHIKEYAN'
+        GITHUB_REPO_NAME   = 'DATA_INTEGRATION'
+        GITHUB_BRANCH      = 'main'
+        GITHUB_CREDENTIAL  = 'GITHUB_TOKEN_SECRET'
+        WORKSPACES_FILE    = 'workspaces.json'
+    }
+
+    stages {
+
+        // ========================================================
+        // STAGE 1 — CHECKOUT
+        // ========================================================
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.GITHUB_BRANCH}"]],
+                    userRemoteConfigs: [[url: "https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}.git"]]
+                ])
+                echo "Repo checked out"
+            }
+        }
+
+        // ========================================================
+        // STAGE 2 — LIST
+        // ========================================================
+
+        stage('List Members') {
+            when { expression { params.ACTION == 'LIST' } }
+            steps {
+                script {
+                    def raw  = readFile(env.WORKSPACES_FILE)
+                    def reg  = readJSON text: raw
+                    def wss  = reg.workspaces.findAll { !it._template }
+
+                    echo "============================================================"
+                    echo "  WORKSPACE REGISTRY  (${wss.size()} member/s)"
+                    echo "============================================================"
+                    echo "  #   STATUS    ROLE        OWNER              JENKINS_USER"
+                    echo "  ─────────────────────────────────────────────────────────"
+
+                    wss.eachWithIndex { ws, i ->
+                        def status = ws.is_active ? "✅ active  " : "❌ inactive"
+                        def role   = (ws.role ?: "developer").padRight(10)
+                        def owner  = (ws.owner ?: "").padRight(18)
+                        echo "  ${(i+1).toString().padLeft(2)}  ${status}  ${role}  ${owner}  ${ws.jenkins_user}"
+                    }
+
+                    echo "============================================================"
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 3 — ADD NEW MEMBER
+        // ========================================================
+
+        stage('Add Member') {
+            when { expression { params.ACTION == 'ADD' } }
+            steps {
+                script {
+
+                    // ── Validate required fields ──────────────────
+                    def missing = []
+                    if (!params.MEMBER_NAME?.trim())     missing << 'MEMBER_NAME'
+                    if (!params.JENKINS_USER?.trim())    missing << 'JENKINS_USER'
+                    if (!params.WORKSPACE_URL?.trim())   missing << 'WORKSPACE_URL'
+                    if (!params.CREDENTIAL_ID?.trim())   missing << 'CREDENTIAL_ID'
+                    if (!params.GITHUB_REPO_PATH?.trim()) missing << 'GITHUB_REPO_PATH'
+
+                    if (missing) {
+                        error "Missing required fields: ${missing.join(', ')}"
+                    }
+
+                    def raw  = readFile(env.WORKSPACES_FILE)
+                    def reg  = readJSON text: raw
+                    def wss  = reg.workspaces
+
+                    // ── Check duplicate ───────────────────────────
+                    def exists = wss.find { it.jenkins_user == params.JENKINS_USER.trim() && !it._template }
+                    if (exists) {
+                        error "Jenkins user '${params.JENKINS_USER}' already exists in workspaces.json.\nUse ACTIVATE to re-enable if deactivated."
+                    }
+
+                    // ── Build new entry ───────────────────────────
+                    def slug     = params.JENKINS_USER.trim().toUpperCase()
+                    def newEntry = [
+                        name             : "${slug}_workspace",
+                        owner            : params.MEMBER_NAME.trim(),
+                        role             : params.ROLE,
+                        jenkins_user     : params.JENKINS_USER.trim(),
+                        workspace_url    : params.WORKSPACE_URL.trim().replaceAll('/$',''),
+                        credential_id    : params.CREDENTIAL_ID.trim(),
+                        catalog          : params.CATALOG?.trim() ?: 'demo_catalog',
+                        github_repo_path : params.GITHUB_REPO_PATH.trim(),
+                        is_active        : true
+                    ]
+
+                    // ── Insert before the _template entry ─────────
+                    def templateIdx = wss.findIndexOf { it._template }
+                    if (templateIdx >= 0) {
+                        wss.add(templateIdx, newEntry)
+                    } else {
+                        wss.add(newEntry)
+                    }
+
+                    reg.workspaces = wss
+                    env.UPDATED_JSON = writeJSON(returnText: true, json: reg, pretty: 2)
+                    env.COMMIT_MSG   = "workspace: add member ${params.MEMBER_NAME} (${params.JENKINS_USER}) [Jenkins]"
+
+                    echo ""
+                    echo "  ┌─ NEW MEMBER ADDED ─────────────────────────────"
+                    echo "  │  Name       : ${newEntry.name}"
+                    echo "  │  Owner      : ${newEntry.owner}"
+                    echo "  │  Role       : ${newEntry.role}"
+                    echo "  │  JenkinsID  : ${newEntry.jenkins_user}"
+                    echo "  │  Workspace  : ${newEntry.workspace_url}"
+                    echo "  │  Credential : ${newEntry.credential_id}"
+                    echo "  └────────────────────────────────────────────────"
+                    echo "  ⚠️  Remember to add credential '${newEntry.credential_id}' in Jenkins → Credentials"
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 4 — DEACTIVATE MEMBER
+        // ========================================================
+
+        stage('Deactivate Member') {
+            when { expression { params.ACTION == 'DEACTIVATE' } }
+            steps {
+                script {
+                    if (!params.TARGET_JENKINS_USER?.trim()) {
+                        error "TARGET_JENKINS_USER is required for DEACTIVATE action."
+                    }
+
+                    def raw = readFile(env.WORKSPACES_FILE)
+                    def reg = readJSON text: raw
+                    def ws  = reg.workspaces.find {
+                        it.jenkins_user == params.TARGET_JENKINS_USER.trim() && !it._template
+                    }
+
+                    if (!ws) {
+                        error "Jenkins user '${params.TARGET_JENKINS_USER}' not found in workspaces.json."
+                    }
+
+                    ws.is_active = false
+                    env.UPDATED_JSON = writeJSON(returnText: true, json: reg, pretty: 2)
+                    env.COMMIT_MSG   = "workspace: deactivate ${params.TARGET_JENKINS_USER} [Jenkins]"
+
+                    echo "  ✅ ${params.TARGET_JENKINS_USER} marked as is_active=false"
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 5 — ACTIVATE MEMBER
+        // ========================================================
+
+        stage('Activate Member') {
+            when { expression { params.ACTION == 'ACTIVATE' } }
+            steps {
+                script {
+                    if (!params.TARGET_JENKINS_USER?.trim()) {
+                        error "TARGET_JENKINS_USER is required for ACTIVATE action."
+                    }
+
+                    def raw = readFile(env.WORKSPACES_FILE)
+                    def reg = readJSON text: raw
+                    def ws  = reg.workspaces.find {
+                        it.jenkins_user == params.TARGET_JENKINS_USER.trim() && !it._template
+                    }
+
+                    if (!ws) {
+                        error "Jenkins user '${params.TARGET_JENKINS_USER}' not found in workspaces.json."
+                    }
+
+                    ws.is_active = true
+                    env.UPDATED_JSON = writeJSON(returnText: true, json: reg, pretty: 2)
+                    env.COMMIT_MSG   = "workspace: activate ${params.TARGET_JENKINS_USER} [Jenkins]"
+
+                    echo "  ✅ ${params.TARGET_JENKINS_USER} marked as is_active=true"
+                }
+            }
+        }
+
+        // ========================================================
+        // STAGE 6 — PUSH TO GITHUB
+        // Runs for ADD / DEACTIVATE / ACTIVATE only
+        // ========================================================
+
+        stage('Push to GitHub') {
+            when {
+                expression {
+                    params.ACTION in ['ADD', 'DEACTIVATE', 'ACTIVATE'] &&
+                    env.UPDATED_JSON?.trim()
+                }
+            }
+            steps {
+                script {
+                    withCredentials([string(credentialsId: env.GITHUB_CREDENTIAL, variable: 'GH_TOKEN')]) {
+
+                        // Get current file SHA
+                        def shaRaw   = sh(
+                            returnStdout: true,
+                            script: """
+                                curl -s -X GET \\
+                                '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/${env.WORKSPACES_FILE}?ref=${env.GITHUB_BRANCH}' \\
+                                -H 'Authorization: Bearer ${GH_TOKEN}'
+                            """
+                        ).trim()
+
+                        def shaJson   = readJSON text: shaRaw
+                        def currentSha = shaJson.sha
+
+                        // Base64 encode updated JSON
+                        def tmpContent = "/tmp/ws_content_${System.currentTimeMillis()}.json"
+                        writeFile file: tmpContent, text: env.UPDATED_JSON
+
+                        def b64 = sh(
+                            returnStdout: true,
+                            script: "base64 -w 0 ${tmpContent}"
+                        ).trim()
+
+                        sh "rm -f ${tmpContent}"
+
+                        // Push via GitHub API
+                        def payload = [
+                            message: env.COMMIT_MSG,
+                            content: b64,
+                            sha    : currentSha,
+                            branch : env.GITHUB_BRANCH
+                        ]
+                        def payloadJson = writeJSON(returnText: true, json: payload)
+                        def tmpPush     = "/tmp/ws_push_${System.currentTimeMillis()}.json"
+                        writeFile file: tmpPush, text: payloadJson
+
+                        def pushRaw = sh(
+                            returnStdout: true,
+                            script: """
+                                curl -s -w "\\n%{http_code}" \\
+                                -X PUT '${env.GITHUB_API}/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO_NAME}/contents/${env.WORKSPACES_FILE}' \\
+                                -H 'Authorization: Bearer ${GH_TOKEN}' \\
+                                -H 'Content-Type: application/json' \\
+                                -d @${tmpPush}
+                            """
+                        ).trim()
+
+                        sh "rm -f ${tmpPush}"
+
+                        def pushCode = pushRaw.split('\n')[-1]
+
+                        if (pushCode in ['200','201']) {
+                            echo "  ✅ workspaces.json pushed to GitHub"
+                            echo "     Commit : ${env.COMMIT_MSG}"
+                        } else {
+                            def pushBody = pushRaw.split('\n')[0..-2].join('\n')
+                            error "GitHub push failed HTTP ${pushCode}: ${pushBody}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "ACTION: ${params.ACTION} | STATUS: ${currentBuild.currentResult}"
+        }
+        success { echo "WORKSPACE MANAGEMENT SUCCESS" }
+        failure { echo "WORKSPACE MANAGEMENT FAILED" }
+    }
+}
