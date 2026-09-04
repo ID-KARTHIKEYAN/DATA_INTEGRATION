@@ -93,62 +93,12 @@ api_post "/2.0/repos/update" "{
 
 echo "✅ Step 1 complete — Git Repo configured"
 
-# ── Step 2 : Create Control Tables via SQL ────────────────────
+# ── Step 2 : Validate existing control-table contract ─────────
 echo ""
-echo "🗄️  Step 2: Creating control tables in catalog: $CATALOG ..."
-
-DDL_SQL=$(cat <<'ENDSQL'
-CREATE SCHEMA IF NOT EXISTS ${CATALOG}.admin;
-
-CREATE TABLE IF NOT EXISTS ${CATALOG}.admin.data_flow_control_header (
-    DATA_FLOW_GROUP_ID  STRING       NOT NULL,
-    JOB_NAME            STRING,
-    NOTEBOOK_PATH       STRING,
-    IS_ACTIVE           STRING       DEFAULT 'Y',
-    CREATED_DATE        TIMESTAMP,
-    UPDATED_DATE        TIMESTAMP
-)
-USING DELTA
-COMMENT 'Controls which ETL group is active and which notebook to execute';
-
-CREATE TABLE IF NOT EXISTS ${CATALOG}.admin.data_flow_l0_detail (
-    DATA_FLOW_GROUP_ID  STRING       NOT NULL,
-    SOURCE_URL          STRING,
-    TARGET_SCHEMA       STRING,
-    TARGET_TABLE        STRING,
-    FILE_FORMAT         STRING,
-    LOAD_TYPE           STRING       DEFAULT 'FULL',
-    IS_ACTIVE           STRING       DEFAULT 'Y',
-    CREATED_DATE        TIMESTAMP,
-    UPDATED_DATE        TIMESTAMP
-)
-USING DELTA
-COMMENT 'L0 (bronze) ingestion detail per group';
-
-CREATE TABLE IF NOT EXISTS ${CATALOG}.admin.data_flow_run_log (
-    LOG_ID              BIGINT       GENERATED ALWAYS AS IDENTITY,
-    DATA_FLOW_GROUP_ID  STRING,
-    TARGET_TABLE        STRING,
-    RUN_STATUS          STRING,
-    ROWS_LOADED         BIGINT,
-    ERROR_MESSAGE       STRING,
-    START_TIME          TIMESTAMP,
-    END_TIME            TIMESTAMP
-)
-USING DELTA
-COMMENT 'Run history log for all ETL executions';
-ENDSQL
-)
-
-# Replace placeholder
-DDL_SQL="${DDL_SQL//\$\{CATALOG\}/$CATALOG}"
-
-STATEMENT_RESPONSE=$(api_post "/2.0/sql/statements" "{
-    \"statement\": \"${DDL_SQL}\",
-    \"wait_timeout\": \"30s\"
-}" 2>&1) || echo "⚠️  SQL statements API not available — run create_control_tables.sql manually in a notebook"
-
-echo "✅ Step 2 complete — Control tables created"
+echo "🗄️  Step 2: Existing metadata tables are the source of truth: $CATALOG.admin"
+echo "   No control-table DDL is executed by this bootstrap."
+echo "   Required tables: data_flow_control_header, data_flow_l0_detail, data_flow_pb_detail, audit_log"
+echo "✅ Step 2 complete — existing contract preserved"
 
 # ── Step 3 : Create the Databricks Job ───────────────────────
 echo ""
@@ -159,17 +109,15 @@ JOB_JSON=$(cat <<ENDJOB
     "name": "DATA_INTEGRATION_JOB",
     "max_concurrent_runs": 3,
     "parameters": [
-        {"name": "GROUP_ID", "default": ""}
+        {"name": "GROUP_ID", "default": ""},
+        {"name": "RUN_LAYER", "default": "L0"}
     ],
     "tasks": [
         {
             "task_key": "run_framework",
-            "notebook_task": {
-                "notebook_path": "${REPO_PATH}/notebooks/run_framework",
-                "base_parameters": {
-                    "GROUP_ID": "{{job.parameters.GROUP_ID}}"
-                },
-                "source": "WORKSPACE"
+            "spark_python_task": {
+                "python_file": "${REPO_PATH}/notebooks/run_framework.py",
+                "parameters": ["{{job.parameters.GROUP_ID}}", "{{job.parameters.RUN_LAYER}}", "", "${CATALOG}"]
             },
             "new_cluster": {
                 "spark_version": "14.3.x-scala2.12",

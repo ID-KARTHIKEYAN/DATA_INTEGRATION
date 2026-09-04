@@ -220,7 +220,7 @@ pipeline {
 
                             def detail = (layer == 'L1' || layer == 'L2') ? 'data_flow_pb_detail' : 'data_flow_l0_detail'
                             def sql    = (layer == 'L0') 
-                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA, COALESCE(PRIORITY, 999) AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY PRIORITY, SOURCE_OBJ_NAME"
+                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA, 999 AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY SOURCE_OBJ_NAME"
                                 : "SELECT TARGET_OBJ_NAME, TARGET_OBJ_SCHEMA, COALESCE(PRIORITY, 999) AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(TARGET_OBJ_TYPE)!='VIEW' ORDER BY PRIORITY, TARGET_OBJ_NAME"
                             def p      = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
                             def tmp    = "/tmp/tbl_${System.currentTimeMillis()}.json"
@@ -257,7 +257,7 @@ pipeline {
                         parallelMap[wsLocal.name] = {
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
                                 def jobName    = "DBX_${groupId}_JOB"
-                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/run_framework"
+                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/run_framework.py"
                                 def tableRows  = tableMap[wsLocal.name] ?: []
                                 def expTasks   = tableRows.isEmpty() ? 1 : tableRows.size()
 
@@ -286,7 +286,7 @@ pipeline {
                                     // Build tasks list with PRIORITY-based dependencies
                                     def tasks = []
                                     if (tableRows.isEmpty()) {
-                                        tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
+                                        tasks = [[task_key:"${groupId}_task", spark_python_task:[python_file:nbPath, parameters:[groupId, env.DETECTED_LAYER, '', wsLocal.catalog ?: 'demo_catalog']]]]
                                     } else {
                                         // Group tables by priority
                                         def priorityGroups = [:]
@@ -303,10 +303,9 @@ pipeline {
                                                 def tbl = r[0]
                                                 def task = [
                                                     task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
-                                                    notebook_task: [
-                                                        notebook_path: nbPath,
-                                                        base_parameters: [GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:tag],
-                                                        source: 'WORKSPACE'
+                                                    spark_python_task: [
+                                                        python_file: nbPath,
+                                                        parameters: [groupId, env.DETECTED_LAYER, "${groupId}|${env.DETECTED_LAYER}|${r[1]}|${r[0]}", wsLocal.catalog ?: 'demo_catalog']
                                                     ]
                                                 ]
                                                 
@@ -340,7 +339,7 @@ pipeline {
                                     echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
                                     tasks.each { t -> 
                                         def deps = t.depends_on ? "[deps: ${t.depends_on.collect{it.task_key}.join(',')}]" : "[no deps]"
-                                        echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'} ${deps}" 
+                                        echo "    task: ${t.task_key} ${deps}"
                                     }
                                 }
                             }
