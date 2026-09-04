@@ -116,9 +116,15 @@ JOB_JSON=$(cat <<ENDJOB
         {
             "task_key": "run_framework",
             "environment_key": "default_env",
-            "spark_python_task": {
-                "python_file": "${REPO_PATH}/notebooks/run_framework.py",
-                "parameters": ["{{job.parameters.GROUP_ID}}", "{{job.parameters.RUN_LAYER}}", "", "${CATALOG}"]
+            "notebook_task": {
+                "notebook_path": "${REPO_PATH}/notebooks/run_framework",
+                "base_parameters": {
+                    "GROUP_ID": "{{job.parameters.GROUP_ID}}",
+                    "RUN_LAYER": "{{job.parameters.RUN_LAYER}}",
+                    "TASK_ID": "",
+                    "CATALOG": "${CATALOG}"
+                },
+                "source": "WORKSPACE"
             }
         }
     ],

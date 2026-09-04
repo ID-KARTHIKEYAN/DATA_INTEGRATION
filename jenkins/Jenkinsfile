@@ -257,7 +257,7 @@ pipeline {
                         parallelMap[wsLocal.name] = {
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
                                 def jobName    = "DBX_${groupId}_JOB"
-                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/run_framework.py"
+                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/run_framework"
                                 def tableRows  = tableMap[wsLocal.name] ?: []
                                 def expTasks   = tableRows.isEmpty() ? 1 : tableRows.size()
 
@@ -286,7 +286,7 @@ pipeline {
                                     // Build tasks list with PRIORITY-based dependencies
                                     def tasks = []
                                     if (tableRows.isEmpty()) {
-                                        tasks = [[task_key:"${groupId}_task", spark_python_task:[python_file:nbPath, parameters:[groupId, env.DETECTED_LAYER, '', wsLocal.catalog ?: 'demo_catalog']], environment_key:'default_env']]
+                                        tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER, TASK_ID:'', CATALOG:(wsLocal.catalog ?: 'demo_catalog')], source:'WORKSPACE'], environment_key:'default_env']]
                                     } else {
                                         // Group tables by priority
                                         def priorityGroups = [:]
@@ -303,9 +303,10 @@ pipeline {
                                                 def tbl = r[0]
                                                 def task = [
                                                     task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
-                                                    spark_python_task: [
-                                                        python_file: nbPath,
-                                                        parameters: [groupId, env.DETECTED_LAYER, "${groupId}|${env.DETECTED_LAYER}|${r[1]}|${r[0]}", wsLocal.catalog ?: 'demo_catalog']
+                                                    notebook_task: [
+                                                        notebook_path: nbPath,
+                                                        base_parameters: [GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER, TASK_ID:"${groupId}|${env.DETECTED_LAYER}|${r[1]}|${r[0]}", CATALOG:(wsLocal.catalog ?: 'demo_catalog')],
+                                                        source: 'WORKSPACE'
                                                     ],
                                                     environment_key: 'default_env'
                                                 ]
