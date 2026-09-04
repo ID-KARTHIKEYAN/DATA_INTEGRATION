@@ -21,7 +21,7 @@ pipeline {
         GITHUB_API           = 'https://api.github.com'
         GITHUB_OWNER         = 'ID-KARTHIKEYAN'
         GITHUB_REPO_NAME     = 'DATA_INTEGRATION'
-        GITHUB_BRANCH        = 'main'
+        GITHUB_BRANCH        = 'feature/metadata-etl-framework'
         GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
         SQL_SCRIPTS_FOLDER   = 'META_STORE_SQL_SCRIPTS'
         POLL_INTERVAL        = '15'
@@ -365,6 +365,16 @@ pipeline {
                     wsList.each { ws ->
                         pMap[ws.name] = {
                             withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
+                                if (!ws.job_id) {
+                                    def jobs = readJSON text: sh(returnStdout:true, script:"curl -s 'https://${ws.workspace_url.replace('https://', '')}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
+                                    def expectedName = "DBX_${groupId}_JOB"
+                                    def existing = jobs.jobs?.find { it.settings?.name == expectedName }
+                                    if (!existing?.job_id) {
+                                        error "No job found for ${expectedName} in ${ws.name}. Enable CREATE_JOBS or create the job first."
+                                    }
+                                    ws.job_id = existing.job_id
+                                    echo "  ${ws.name}: resolved existing job_id=${ws.job_id}"
+                                }
                                 def tp  = writeJSON(returnText:true, json:[job_id:ws.job_id, job_parameters:[GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER]])
                                 def tf  = "/tmp/trig_${System.currentTimeMillis()}.json"
                                 writeFile file:tf, text:tp
