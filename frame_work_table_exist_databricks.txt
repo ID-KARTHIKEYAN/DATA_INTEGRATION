@@ -1,0 +1,108 @@
+
+describe demo_catalog.admin.data_flow_l0_detail
+DATA_FLOW_GROUP_ID	string	Logical Group ID in which specified tables/mv's will be loaded in the specified layer.
+SOURCE	string	Source name from which the source object is fetched in the landing layer - s3 bucket.
+SOURCE_OBJ_SCHEMA	string	Name of source schema in which source object in present.
+SOURCE_OBJ_NAME	string	Name of source object name.
+LOB	string	Line of Business.
+LOAD_TYPE	string	Load type for the target table. It should be either 'FULL', 'DELTA'.
+INPUT_FILE_FORMAT	string	Type of file format in which data files present in landing layer - s3 bucket.
+STORAGE_TYPE	string	Type of S3 bucket that will be used to populate l0 layer objects.
+DQ_LOGIC	string	Data Quality Logic
+DELIMETER	string	Delimeter for csv files (if required) and xml (for row tags)
+CUSTOM_SCHEMA	string	Custom Schema which will be used for tsv file formats processing.
+CDC_LOGIC	string	Change data capture logic for delta load type.
+TRANSFORM_QUERY	map<string,string>	Key : Value pairs of every column with its corresponsing cast expression for only those columns that needs to be casted in l0 layer.
+PRESTAG_FLAG	varchar(1)	It should be either 'Y' - for creating streaming table or 'N' for creating external in stage schema
+PARTITION	string	comma separated column list on which partitioning will be applied for the table.
+LS_FLAG	string	Lift & Shift Flag. It should be either 'Y' or 'N'
+LS_DETAIL	string	Lift & Shift details.
+IS_ACTIVE	string	Indicates the current state of table. If 'Y' - then only will be loaded in the next pipeline execution & vice versa.
+INSERTED_BY	string	By whom the record is getting inserted in the table.
+UPDATED_BY	string	By whom the record is getting updated in the table.
+INSERTED_TS	timestamp	At what time the record is getting inserted in the table.
+UPDATED_TS	timestamp	At what time the record is getting updated in the table.
+DEPLOYMENT_SOURCE_DFG	string	
+
+describe demo_catalog.admin.data_flow_pb_detail
+DATA_FLOW_GROUP_ID	string	Logical Group ID in which specified tables/mv's will be loaded in the specified layer.
+LOB	string	Line of Business
+SOURCE	string	
+TARGET_OBJ_SCHEMA	string	Target Schema name in which the table/mv will be published.
+TARGET_OBJ_NAME	string	Target table/mv name
+PRIORITY	int	It decides the parallelism of loading all the active tables. Tables having same priority will be loaded parallely & same for next priority tables.
+TARGET_OBJ_TYPE	string	Type of object that will be created by the Pipeline. It should be either Table or MV.
+TRANSFORM_QUERY	string	Transformed select query by executing which the target table/mv will be loaded.
+GENERIC_SCRIPTS	string	In case of 'PYSPARK' load type, name of all the scripts getting used in the pipeline execution.
+SOURCE_PK	string	comma separated source primary keys.
+TARGET_PK	string	comma separated target primary keys.
+LOAD_TYPE	string	Load type for the target table. It should be either 'FULL', 'DELTA' or 'SCD'. And it is not applicable for MV target object type.
+IS_ACTIVE	string	Indicates the current state of table/mv. If 'Y' - then only will be loaded in the next pipeline execution & vice versa.
+LS_FLAG	string	Lift & Shift flag. It should be either 'Y' or 'N'
+LS_DETAIL	string	Lift & Shift details.
+PARTITION_OR_INDEX	string	comma separated column list on which partition or liquid clustering will be applied. Its optional.
+INSERTED_BY	string	By whom the record is getting inserted in the table.
+UPDATED_BY	string	By whom the record is getting updated in the table.
+INSERTED_TS	timestamp	At what time the record is getting inserted in the table.
+UPDATED_TS	timestamp	At what time the record is getting updated in the table.
+CUSTOM_SCRIPT_PARAMS	map<string,string>	Sample to add entries is here, SET CUSTOM_SCRIPT_PARAMS = MAP('CUSTOM_PARAM1', 'CUSTOM_VALUE1', 'CUSTOM_PARAM2', 'CUSTOM_VALUE2')
+PARTITION_METHOD	string	Partition method which will be applied on the target table/mv. It should be either 'PARTITION' or 'LIQUID_CLUSTER'. Its optional.
+RETENTION_DETAILS	string	Retention details using which retention table will be created for table type. Its optional.
+DEPLOYMENT_SOURCE_DFG	string	
+
+
+describe demo_catalog.admin.data_flow_control_header
+DATA_FLOW_GROUP_ID	string	Logical Group ID in which specified tables/mv's will be loaded in the specified layer.
+TRIGGER_TYPE	string	Decides the deployment & data load method. For L0, it should be 'DLT' & for L1 - it can be either 'DLT' or 'JOB'.
+ETL_LAYER	string	Layer name (L0, L1, L2).
+COMPUTE_CLASS_DEV	string	Compute type which will be used to process data on dev environment.
+COMPUTE_CLASS	string	Compute type which will be used to process data on qa & prod environment.
+IS_ACTIVE	string	Indicates current state of pipeline. For deployment & execution of pipeline, it should be 'Y'. And 'N' to deactive the pipeline.
+INSERTED_BY	string	By whom the record is getting inserted in the table.
+UPDATED_BY	string	By whom the record is getting updated in the table.
+INSERTED_TS	timestamp	At what time the record is getting inserted in the table.
+UPDATED_TS	timestamp	At what time the record is getting updated in the table.
+BUSINESS_OBJECT_NAME	string	Data product name, which will be build as final downstream business product.
+COST_CENTER	string	
+DATA_SME	string	Name of SME for the respective data product.
+BUSINESS_UNIT	string	Business Unit name.
+PRODUCT_OWNER	string	Data product owner's name.
+INGESTION_MODE	string	Name of ingestion mode in which data were ingested in s3 bucket. It is only applicable for L0 layer.
+INGESTION_BUCKET	string	Category of ingestion bucket in which data were ingested in aws s3.
+SPARK_CONFIGS	string	Specific spark configurations that needs to be applied on the job pipeline's job cluster.
+WARNING_THRESHOLD_MINS	int	Time (in minutes), to get warning/alerts if pipeline runtime exeeds.
+WARNING_DL_GROUP	string	Warning DL group name.
+MIN_VERSION	string	Stable version of codebase that will be used by the pipelines to load data. If null, max available version will be used for the process.
+MAX_VERSION	string	New version of codebase that will be used by the pipelines to load data. If fails to install during pipeline execution, it will use MIN_VERSION for the process. And even if MIN_VERSION fails to install or If it is null then maximum available version of the wheel package will be used for the process.
+target_catalog	string	
+
+
+
+
+sample data
+INSERT INTO demo_catalog.admin.data_flow_l0_detail (DATA_FLOW_GROUP_ID, `SOURCE`, SOURCE_OBJ_SCHEMA, SOURCE_OBJ_NAME, LOB, LOAD_TYPE, INPUT_FILE_FORMAT, STORAGE_TYPE, DQ_LOGIC, DELIMETER, CUSTOM_SCHEMA, CDC_LOGIC, TRANSFORM_QUERY, PRESTAG_FLAG, `PARTITION`, LS_FLAG, LS_DETAIL, IS_ACTIVE, INSERTED_BY, UPDATED_BY, INSERTED_TS, UPDATED_TS, DEPLOYMENT_SOURCE_DFG) VALUES('EMPLOYEE_MASTER_L0', 'https://raw.githubusercontent.com/ID-KARTHIKEYAN/DATA_INTEGRATION/main/employee_master_data_messy_10000.csv', 'raw', 'employee_master_data_messy_10000.csv', 'HR', 'FULL', 'csv', 'https://raw.githubusercontent.com/ID-KARTHIKEYAN/DATA_INTEGRATION/refs/heads/main', NULL, ',', NULL, NULL, NULL, 'N', NULL, 'N', NULL, 'Y', 'admin', 'admin', '2026-08-29 07:44:29.768', '2026-08-29 08:05:56.130', NULL);
+
+
+INSERT INTO demo_catalog.admin.data_flow_pb_detail (DATA_FLOW_GROUP_ID, LOB, `SOURCE`, TARGET_OBJ_SCHEMA, TARGET_OBJ_NAME, PRIORITY, TARGET_OBJ_TYPE, TRANSFORM_QUERY, GENERIC_SCRIPTS, SOURCE_PK, TARGET_PK, LOAD_TYPE, IS_ACTIVE, LS_FLAG, LS_DETAIL, PARTITION_OR_INDEX, INSERTED_BY, UPDATED_BY, INSERTED_TS, UPDATED_TS, CUSTOM_SCRIPT_PARAMS, PARTITION_METHOD, RETENTION_DETAILS, DEPLOYMENT_SOURCE_DFG) VALUES('STU_ACTIVITY_L1', NULL, 'bronze', 'silver', 'dim_group_silver', 1, 'Table', 'SELECT
+        CAST(group_id AS STRING) AS group_id,
+        TRIM(group_name) AS group_name,
+        TRIM(department) AS department,
+        TRIM(mentor_name) AS mentor_name,
+        current_timestamp() AS ingestion_timestamp
+     FROM demo_catalog.bronze.dim_group
+     WHERE group_id IS NOT NULL', NULL, NULL, NULL, 'FULL', 'Y', NULL, NULL, NULL, 'migration', 'migration', '2026-06-24 07:07:35.672', '2026-06-24 07:07:35.672', NULL, NULL, NULL, NULL);
+	 
+	 
+	 
+	 
+INSERT INTO demo_catalog.admin.data_flow_control_header (DATA_FLOW_GROUP_ID, TRIGGER_TYPE, ETL_LAYER, COMPUTE_CLASS_DEV, COMPUTE_CLASS, IS_ACTIVE, INSERTED_BY, UPDATED_BY, INSERTED_TS, UPDATED_TS, BUSINESS_OBJECT_NAME, COST_CENTER, DATA_SME, BUSINESS_UNIT, PRODUCT_OWNER, INGESTION_MODE, INGESTION_BUCKET, SPARK_CONFIGS, WARNING_THRESHOLD_MINS, WARNING_DL_GROUP, MIN_VERSION, MAX_VERSION, target_catalog) VALUES('EMPLOYEE_MASTER_L0', 'JOB', 'L0', 'serverless', 'serverless', 'Y', 'admin', 'admin', '2026-08-29 07:44:08.383', '2026-08-29 07:44:08.383', 'Employee Master Data', 'HR', 'HR Data Team', 'Human Resources', 'HR Manager', 'github', 'raw_data', NULL, NULL, NULL, NULL, NULL, 'demo_catalog');
+
+
+INSERT INTO demo_catalog.admin.audit_log (DATA_FLOW_GROUP_ID, TARGET_TABLE, STATUS, MESSAGE, CREATED_DATE, ETL_LAYER, ROWS_PROCESSED, START_TIME, END_TIME, LOAD_TS) VALUES('EMPLOYEE_MASTER_L1', 'clean_employee_master', 'FAILED', 'L1: Traceback (most recent call last):
+  File "/home/spark-cd33da18-577e-47c6-888f-a3/.ipykernel/2956/command-6009344428104906-3918638900", line 42, in run_l1
+    df = spark.sql(final_query)
+         ^^^^^^^^^^^^^^^^^^^^^^
+  File "/databricks/python/lib/python3.12/site-packages/pyspark/sql/connect/session.py", line 901, in sql
+    data, properties, ei = self.client.execute_command(cmd.command(self._client))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/da', '2026-05-31 11:21:04.363', NULL, NULL, NULL, NULL, NULL);
