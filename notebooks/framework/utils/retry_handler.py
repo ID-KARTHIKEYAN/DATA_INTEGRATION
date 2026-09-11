@@ -126,3 +126,4 @@ def retry_with_backoff(max_attempts: int = 3, base_delay_sec: float = 1.0,
             return handler.execute(func, *args, **kwargs)
         wrapper.__name__ = func.__name__
         return wrapper
+    return decorator
