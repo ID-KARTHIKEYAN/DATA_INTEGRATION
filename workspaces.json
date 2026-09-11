@@ -14,7 +14,7 @@
       "workspace_url": "https://dbc-9e0f543c-87b6.cloud.databricks.com",
       "credential_id": "DATABRICKS_TOKEN_KARTHIK",
       "catalog": "demo_catalog",
-      "github_repo_path": "/Workspace/Repos/svkarthick0@gmail.com/DATA_INTEGRATION",
+      "github_repo_path": "/Repos/svkarthick0@gmail.com/DATA_INTEGRATION",
       "is_active": true
     },
         {
