@@ -266,16 +266,6 @@ def build_tasks(data_flow_group_id: str, etl_layer: str, targets: list,
 def build_job_payload(group_id: str, etl_layer: str, tasks: list,
                       compute_class_dev: str, compute_class: str,
                       runner_notebook: str):
-    # Free Edition compatible: no cluster_id or serverless without premium
-    new_cluster_spec = {
-        "spark_version": "15.4.x-scala2.12",
-        "node_type_id":  "i3.xlarge",
-        "num_workers":   0,          # single node to save $ on free tier
-        "spark_conf": {
-            "spark.databricks.delta.preview.enabled": "true",
-            "spark.sql.catalogImplementation": "hive",
-        },
-    }
     payload = {
         "name": f"DBX_{group_id}_JOB",
         "description": (
@@ -291,12 +281,8 @@ def build_job_payload(group_id: str, etl_layer: str, tasks: list,
             {"name": "LOB",              "default": ""},
             {"name": "RUN_LAYER",        "default": etl_layer if etl_layer in ("L0","L1","L2") else "AUTO"},
         ],
-        "tasks": [],
+        "tasks": tasks,
     }
-    # Attach task cluster (tasks share)
-    for t in tasks:
-        t.setdefault("new_cluster", new_cluster_spec)
-    payload["tasks"] = tasks
     return payload
 
 results = []

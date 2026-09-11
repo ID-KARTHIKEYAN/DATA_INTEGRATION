@@ -145,14 +145,14 @@ pipeline {
                             def r    = readJSON(text: sh(
                                 returnStdout:true,
                                 script:"curl -s --max-time 30 '${ws.workspace_url}/api/2.0/repos' " +
-                                       "-H 'Authorization: Bearer ${DB_TOKEN}'"
+                                       "-H \"Authorization: Bearer \$DB_TOKEN\""
                             ).trim())
                             def repo = r.repos?.find { it.path == ws.github_repo_path }
                             if (!repo) {
                                 echo "  ${ws.name}: repo path not found — attempt create then sync"
                                 try {
                                     sh """curl -sS --max-time 30 -X POST '${ws.workspace_url}/api/2.0/repos' \\
-                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H "Authorization: Bearer \$DB_TOKEN" \\
                                             -H 'Content-Type: application/json' \\
                                             -d '{"url":"${env.GITHUB_REPO}",
                                                   "provider":"gitHub",
@@ -163,7 +163,7 @@ pipeline {
                                 def repo_id = repo.id
                                 def code = sh(returnStdout:true, script:"""
                                     curl -sS -w "\\n%{http_code}" -X PATCH '${ws.workspace_url}/api/2.0/repos/${repo_id}' \\
-                                      -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                      -H "Authorization: Bearer \$DB_TOKEN" \\
                                       -H 'Content-Type: application/json' \\
                                       -d '{"branch":"${env.GITHUB_BRANCH}"}'
                                 """).trim().split('\n')[-1]
@@ -200,7 +200,7 @@ pipeline {
                                 // Grab a warehouse id to run metadata SQL statements
                                 def wh = readJSON(text: sh(returnStdout:true, script:"""
                                     curl -s --max-time 30 '${wsLocal.workspace_url}/api/2.0/sql/warehouses' \\
-                                         -H 'Authorization: Bearer ${DB_TOKEN}'""").trim())
+                                         -H "Authorization: Bearer \$DB_TOKEN"""").trim())
                                 def whId = (wh.warehouses ?: []).size() > 0 ? wh.warehouses[0].id : null
 
                                 if (whId) {
@@ -232,7 +232,7 @@ pipeline {
                                     writeFile file: tmp, text: stmtPayload
                                     def raw = sh(returnStdout:true, script:"""
                                         curl -sS -w "\\n%{http_code}" -X POST '${wsLocal.workspace_url}/api/2.0/sql/statements' \\
-                                          -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                          -H "Authorization: Bearer \$DB_TOKEN" \\
                                           -H 'Content-Type: application/json' -d @${tmp}
                                     """).trim()
                                     sh "rm -f ${tmp}"
@@ -272,14 +272,6 @@ pipeline {
                                                             ],
                                                             source: 'WORKSPACE',
                                                         ],
-                                                        new_cluster: [
-                                                            spark_version: '15.4.x-scala2.12',
-                                                            node_type_id:  'i3.xlarge',
-                                                            num_workers:   0,
-                                                            spark_conf: [
-                                                                'spark.databricks.delta.preview.enabled':'true',
-                                                            ],
-                                                        ],
                                                     ]
                                                     if (prev) task.depends_on = prev.collect { [task_key: it] }
                                                     tasks.add(task); cur.add(tkey)
@@ -306,21 +298,13 @@ pipeline {
                                             ],
                                             source: 'WORKSPACE',
                                         ],
-                                        new_cluster: [
-                                            spark_version: '15.4.x-scala2.12',
-                                            node_type_id:  'i3.xlarge',
-                                            num_workers:   0,
-                                            spark_conf: [
-                                                'spark.databricks.delta.preview.enabled':'true',
-                                            ],
-                                        ],
                                     ]]
                                 }
 
                                 // Delete existing job if already there to refresh task DAG
                                 def listJ = readJSON(text: sh(returnStdout:true, script:"""
                                     curl -s --max-time 30 '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' \\
-                                         -H 'Authorization: Bearer ${DB_TOKEN}'""").trim())
+                                         -H "Authorization: Bearer \$DB_TOKEN"""").trim())
                                 def existing = (listJ.jobs ?: []).find { it.settings?.name == jobName }
                                 if (existing) {
                                     echo "  ${wsLocal.name}: deleting stale job_id=${existing.job_id}"
@@ -328,7 +312,7 @@ pipeline {
                                     def dfile = "/tmp/del_${System.currentTimeMillis()}.json"
                                     writeFile file: dfile, text: delJson
                                     sh """curl -sS --max-time 30 -X POST '${wsLocal.workspace_url}/api/2.1/jobs/delete' \\
-                                            -H 'Authorization: Bearer ${DB_TOKEN}' \\
+                                            -H "Authorization: Bearer \$DB_TOKEN" \\
                                             -H 'Content-Type: application/json' -d @${dfile} || true"""
                                     sh "rm -f ${dfile}"
                                 }
@@ -351,7 +335,7 @@ pipeline {
                                 writeFile file: jf, text: payload
                                 def raw = sh(returnStdout:true, script:"""
                                     curl -sS -w "\\n%{http_code}" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' \\
-                                      -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${jf}
+                                      -H "Authorization: Bearer \$DB_TOKEN" -H 'Content-Type: application/json' -d @${jf}
                                 """).trim()
                                 sh "rm -f ${jf}"
                                 def lines = raw.split('\n'); def code = lines[-1]
@@ -399,7 +383,7 @@ pipeline {
                                 writeFile file: tf, text: tp
                                 def raw = sh(returnStdout:true, script:"""
                                     curl -sS -w "\\n%{http_code}" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/run-now' \\
-                                      -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tf}
+                                      -H "Authorization: Bearer \$DB_TOKEN" -H 'Content-Type: application/json' -d @${tf}
                                 """).trim()
                                 sh "rm -f ${tf}"
                                 def lines = raw.split('\n'); def code = lines[-1]
@@ -441,7 +425,7 @@ pipeline {
                                 elapsed += pollSecs
                                 def p = readJSON(text: sh(returnStdout:true, script:"""
                                     curl -s --max-time 30 '${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}' \\
-                                         -H 'Authorization: Bearer ${DB_TOKEN}'""").trim())
+                                         -H "Authorization: Bearer \$DB_TOKEN"""").trim())
                                 lc = p.state?.life_cycle_state ?: 'UNKNOWN'
                                 rs = p.state?.result_state     ?: ''
                                 echo "${wsName}: ${lc} / ${rs}  (${elapsed}/${maxSecs}s)"
