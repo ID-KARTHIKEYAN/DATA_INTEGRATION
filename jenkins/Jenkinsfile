@@ -26,6 +26,8 @@ pipeline {
         string(name: 'VERSION',    defaultValue: '1.0', description: 'Pipeline version')
         string(name: 'RUN_LAYER',  defaultValue: 'AUTO',
                description: 'Override layer: AUTO/L0/L1/L2/ALL')
+        string(name: 'ENVIRONMENT', defaultValue: 'dev',
+               description: 'Environment label passed to runner tasks (dev/qa/prod)')
         booleanParam(name: 'SYNC_GIT',             defaultValue: true,
                      description: 'Sync GitHub repo to workspace repos')
         booleanParam(name: 'SYNC_TABLES_TO_GITHUB', defaultValue: false,
@@ -191,163 +193,132 @@ pipeline {
                         parallelMap[wsLocal.name] = {
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
                                 def catalog   = wsLocal.catalog ?: env.DEFAULT_CATALOG
-                                def ctrlTbl   = "${catalog}.${env.CONTROL_SCHEMA}"
+
+                                def resolveLayer = { gid, lyr ->
+                                    def r = (lyr ?: 'AUTO').toString().trim().toUpperCase()
+                                    if (r in ['L0','L1','L2','ALL']) return r
+                                    def g = (gid ?: '').trim().toUpperCase()
+                                    if (g.endsWith('_L0')) return 'L0'
+                                    if (g.endsWith('_L1')) return 'L1'
+                                    if (g.endsWith('_L2')) return 'L2'
+                                    return 'ALL'
+                                }
+                                def effLayer = resolveLayer(groupId, layer)
+                                def runLayer = effLayer == 'ALL' ? 'AUTO' : effLayer
+
                                 def jobName   = "DBX_${groupId}_JOB"
                                 def nbPath    = "${wsLocal.github_repo_path}/${runner}"
-                                def tasks     = []
-                                def expTasks  = 1
+                                def automNb   = "${wsLocal.github_repo_path}/notebooks/job_creation_automation"
 
-                                // Grab a warehouse id to run metadata SQL statements
-                                def wh = readJSON(text: sh(returnStdout:true, script:"""
-                                    curl -s --max-time 30 '${wsLocal.workspace_url}/api/2.0/sql/warehouses' \\
-                                         -H "Authorization: Bearer ${'$DB_TOKEN'}"
-                                """).trim())
-                                def whId = (wh.warehouses ?: []).size() > 0 ? wh.warehouses[0].id : null
+                                // -----------------------------------------------------------------
+                                // Deploy by submitting the EXACT SAME automation notebook the
+                                // user runs interactively in Databricks.  It uses Spark SQL to
+                                // read control table metadata, builds tasks per GROUP_ID +
+                                // PRIORITY buckets, then calls /jobs/create or /jobs/reset (reconcile)
+                                // via the REST API.  No intermediate discovery step, no clutter,
+                                // no Groovy serialization surprises.
+                                // -----------------------------------------------------------------
+                                def automParams = [
+                                    GROUP_ID:         groupId,
+                                    RUN_LAYER:        runLayer,
+                                    DATABRICKS_TOKEN: DB_TOKEN,
+                                    CATALOG:          catalog,
+                                    CONTROL_SCHEMA:   env.CONTROL_SCHEMA,
+                                    ENVIRONMENT:      params.ENVIRONMENT,
+                                    WORKSPACE_URL:    wsLocal.workspace_url,
+                                    RUNNER_NOTEBOOK:  nbPath,
+                                    RUN_COMPUTE_CLASS_DEV: (wsLocal.compute_class_dev  ?: 'IDLE'),
+                                    RUN_COMPUTE_CLASS:     (wsLocal.compute_class      ?: 'IDLE'),
+                                ]
 
-                                if (whId) {
-                                    // Run SQL via statement API to discover table list from metadata
-                                    def sql
-                                    if (layer in ['L0','ALL']) {
-                                        sql = """
-                                            SELECT SOURCE_OBJ_SCHEMA, SOURCE_OBJ_NAME,
-                                                   CAST(999 AS INT) AS PRIORITY, LOAD_TYPE
-                                            FROM ${ctrlTbl}.data_flow_l0_detail
-                                            WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'
-                                            ORDER BY SOURCE_OBJ_SCHEMA, SOURCE_OBJ_NAME
-                                        """
-                                    } else {
-                                        sql = """
-                                            SELECT TARGET_OBJ_SCHEMA, TARGET_OBJ_NAME,
-                                                   COALESCE(PRIORITY, 999) AS PRIORITY, LOAD_TYPE,
-                                                   TARGET_OBJ_TYPE
-                                            FROM ${ctrlTbl}.data_flow_pb_detail
-                                            WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y'
-                                            ORDER BY COALESCE(PRIORITY, 999), TARGET_OBJ_SCHEMA, TARGET_OBJ_NAME
-                                        """
-                                    }
-                                    def stmtPayload = writeJSON(returnText:true, json:[
-                                        statement: sql, warehouse_id: whId,
-                                        wait_timeout:'60s', on_wait_timeout:'CANCEL'
-                                    ])
-                                    def tmp = "/tmp/md_${groupId}_${System.currentTimeMillis()}.json"
-                                    writeFile file: tmp, text: stmtPayload
-                                    def raw = sh(returnStdout:true, script:"""
-                                        curl -sS -w "\\n%{http_code}" -X POST '${wsLocal.workspace_url}/api/2.0/sql/statements' \\
-                                          -H "Authorization: Bearer ${'$DB_TOKEN'}" \\
-                                          -H 'Content-Type: application/json' -d @${tmp}
-                                    """).trim()
-                                    sh "rm -f ${tmp}"
-                                    def lines = raw.split('\n')
-                                    def code  = lines[-1]
-                                    if (code == '200') {
-                                        def body = readJSON(text: lines[0..-2].join('\n'))
-                                        def rows = body.result?.data_array ?: []
-                                        if (rows) {
-                                            expTasks = rows.size()
-                                            def buckets = [:]
-                                            rows.each { r ->
-                                                def schema = r[0]; def name = r[1]
-                                                def prio   = (r[2] ?: 999).toString().isInteger() ? r[2].toInteger() : 999
-                                                def cleanName = name
-                                                if (layer in ['L0','ALL']) {
-                                                    if (cleanName ==~ /(?i).*\\.(csv|tsv|json|parquet|xml|xlsx?)$/) {
-                                                        cleanName = cleanName.take(cleanName.lastIndexOf('.'))
-                                                    }
-                                                }
-                                                (buckets[prio] = buckets[prio] ?: []).add([schema: schema, name: cleanName])
-                                            }
-                                            def prev = []
-                                            buckets.sort().each { prio, tgts ->
-                                                def cur = []
-                                                tgts.each { t ->
-                                                    def tkey = (t.schema + '_' + t.name).replaceAll('[^A-Za-z0-9_]','_').take(80)
-                                                    def task = [
-                                                        task_key: tkey,
-                                                        notebook_task: [
-                                                            notebook_path: nbPath,
-                                                            base_parameters: [
-                                                                GROUP_ID: groupId,
-                                                                TARGET_LOAD_TABLE: t.name,
-                                                                ENVIRONMENT: params.VERSION,
-                                                                RUN_LAYER: layer == 'ALL' ? 'AUTO' : layer,
-                                                            ],
-                                                            source: 'WORKSPACE',
-                                                        ],
-                                                    ]
-                                                    if (prev) task.depends_on = prev.collect { [task_key: it] }
-                                                    tasks.add(task); cur.add(tkey)
-                                                }
-                                                prev = cur
-                                            }
-                                        }
-                                    } else {
-                                        echo "  ${wsLocal.name}: SQL statement failed HTTP ${code}; using fallback 1-task job"
-                                    }
-                                }
-
-                                // Fallback to 1 task with TARGET_LOAD_TABLE="" (all)
-                                if (!tasks) {
-                                    tasks = [[
-                                        task_key: "${groupId}_ALL",
+                                def submitMap = [
+                                    run_name: "Jenkins deploy ${groupId} [${env.VERSION}]",
+                                    timeout_seconds: 600,
+                                    tasks: [[
+                                        task_key: 'deploy_job',
                                         notebook_task: [
-                                            notebook_path: nbPath,
-                                            base_parameters: [
-                                                GROUP_ID: groupId,
-                                                TARGET_LOAD_TABLE: env.TARGET_TBL,
-                                                ENVIRONMENT: params.VERSION,
-                                                RUN_LAYER: layer == 'ALL' ? 'AUTO' : layer,
-                                            ],
+                                            notebook_path: automNb,
+                                            base_parameters: automParams,
                                             source: 'WORKSPACE',
                                         ],
-                                    ]]
+                                    ]],
+                                ]
+                                if (wsLocal.git_source_override) {
+                                    submitMap.git_source = wsLocal.git_source_override
                                 }
+                                def automSubmit = writeJSON(returnText:true, json: submitMap)
+                                def automFile = "/tmp/autom_${groupId}_${System.currentTimeMillis()}.json"
+                                writeFile file: automFile, text: automSubmit
 
-                                // Delete existing job if already there to refresh task DAG
-                                def listJ = readJSON(text: sh(returnStdout:true, script:"""
-                                    curl -s --max-time 30 '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' \\
-                                         -H "Authorization: Bearer ${'$DB_TOKEN'}"
-                                """).trim())
-                                def existing = (listJ.jobs ?: []).find { it.settings?.name == jobName }
-                                if (existing) {
-                                    echo "  ${wsLocal.name}: deleting stale job_id=${existing.job_id}"
-                                    def delJson = writeJSON(returnText:true, json:[job_id: existing.job_id])
-                                    def dfile = "/tmp/del_${System.currentTimeMillis()}.json"
-                                    writeFile file: dfile, text: delJson
-                                    sh """curl -sS --max-time 30 -X POST '${wsLocal.workspace_url}/api/2.1/jobs/delete' \\
-                                            -H "Authorization: Bearer ${'$DB_TOKEN'}" \\
-                                            -H 'Content-Type: application/json' -d @${dfile} || true"""
-                                    sh "rm -f ${dfile}"
-                                }
-
-                                def payload = writeJSON(returnText:true, json:[
-                                    name: jobName,
-                                    description: "Auto by Jenkins | ${env.BUNDLE_INFO}",
-                                    max_concurrent_runs: 1,
-                                    timeout_seconds: 43200,
-                                    parameters: [
-                                        [name:'GROUP_ID',          default: groupId],
-                                        [name:'TARGET_LOAD_TABLE', default: env.TARGET_TBL ?: ''],
-                                        [name:'ENVIRONMENT',       default: params.VERSION],
-                                        [name:'LOB',               default: ''],
-                                        [name:'RUN_LAYER',         default: layer == 'ALL' ? 'AUTO' : layer],
-                                    ],
-                                    tasks: tasks,
-                                ])
-                                def jf = "/tmp/job_${System.currentTimeMillis()}.json"
-                                writeFile file: jf, text: payload
-                                def raw = sh(returnStdout:true, script:"""
-                                    curl -sS -w "\\n%{http_code}" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' \\
-                                      -H "Authorization: Bearer ${'$DB_TOKEN'}" -H 'Content-Type: application/json' -d @${jf}
+                                def submitRaw = sh(returnStdout:true, script:"""
+                                    curl -sS -w "\\n%{http_code}" --max-time 30 -X POST '${wsLocal.workspace_url}/api/2.1/jobs/runs/submit' \\
+                                      -H "Authorization: Bearer ${'$DB_TOKEN'}" \\
+                                      -H 'Content-Type: application/json' -d @${automFile}
                                 """).trim()
-                                sh "rm -f ${jf}"
-                                def lines = raw.split('\n'); def code = lines[-1]
-                                if (code != '200') error "Job create HTTP ${code}: ${lines[0..-2].join('\\n')}"
-                                def cjson = readJSON(text: lines[0..-2].join('\\n'))
-                                wsLocal.job_id = cjson.job_id
-                                echo "  ${wsLocal.name}: job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
-                                tasks.eachWithIndex { t, idx ->
+                                sh "rm -f ${automFile}"
+                                def sL = submitRaw.split('\n')
+                                def sCode = sL[-1]
+                                def sBody = sL[0..-2].join('\n')
+                                echo "  ${wsLocal.name}: deploy/submit HTTP ${sCode}"
+                                if (sCode != '200') error "Deploy submit failed: ${sBody.take(500)}"
+                                def runId = readJSON(text: sBody).run_id
+                                echo "  ${wsLocal.name}: deploy run_id=${runId} (polling)"
+
+                                def maxAttempts = 45
+                                String finalState = null
+                                for (def a = 1; a <= maxAttempts; a++) {
+                                    sleep 10
+                                    def pollRaw = sh(returnStdout:true, script:"""
+                                        curl -sS -w "\\n%{http_code}" --max-time 15 -X GET '${wsLocal.workspace_url}/api/2.1/jobs/runs/get?run_id=${runId}' \\
+                                          -H "Authorization: Bearer ${'$DB_TOKEN'}"
+                                    """).trim()
+                                    def pl = pollRaw.split('\n')
+                                    if (pl[-1] != '200') continue
+                                    def pj = readJSON(text: pl[0..-2].join('\n'))
+                                    def st = pj.state?.life_cycle_state ?: ''
+                                    def rs = pj.state?.result_state    ?: ''
+                                    echo "    attempt ${a}/${maxAttempts}: life_cycle=${st} result=${rs}"
+                                    if (st in ['TERMINATED','SKIPPED','INTERNAL_ERROR']) {
+                                        finalState = rs
+                                        if (st == 'INTERNAL_ERROR' || rs == 'FAILED') {
+                                            def errRaw = sh(returnStdout:true, script:"""
+                                                curl -sS --max-time 15 -X GET '${wsLocal.workspace_url}/api/2.1/jobs/runs/get-output?run_id=${runId}' \\
+                                                  -H "Authorization: Bearer ${'$DB_TOKEN'}"
+                                            """).trim()
+                                            def eL = errRaw.split('\n')
+                                            if (eL[-1] == '200') {
+                                                def ej = readJSON(text: eL[0..-2].join('\n'))
+                                                echo "  ERROR trace: ${(ej.error?:'').toString().take(800)}"
+                                                if (ej.notebook_output?.result) echo "  notebook output: ${ej.notebook_output.result.toString().take(300)}"
+                                            }
+                                            error "Deploy run FAILED result_state=${rs} (see above)"
+                                        }
+                                        break
+                                    }
+                                }
+                                if (!finalState) error "Deploy run_id=${runId} timed out after ${maxAttempts*10}s"
+
+                                // Verify the job was actually created with correct task count
+                                def existing = null
+                                def offset = 0
+                                while (existing == null) {
+                                    def listJ = readJSON(text: sh(returnStdout:true, script:"""
+                                        curl -s --max-time 30 '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100&offset=${offset}' \\
+                                             -H "Authorization: Bearer ${'$DB_TOKEN'}"
+                                    """).trim())
+                                    def jp = listJ.jobs ?: []
+                                    existing = jp.find { it.settings?.name == jobName }
+                                    if (existing || !listJ.has_more || jp.size() == 0) break
+                                    offset += jp.size()
+                                }
+                                if (!existing) error "Job ${jobName} not found after deploy run completed"
+                                wsLocal.job_id = existing.job_id
+                                def taskCnt = existing.settings?.tasks?.size() ?: 1
+                                echo "  ${wsLocal.name}: ✅ job_id=${wsLocal.job_id}  name=${jobName}  tasks=${taskCnt}"
+                                (existing.settings?.tasks ?: []).eachWithIndex { t, idx ->
                                     def deps = t.depends_on ? t.depends_on*.task_key.join(',') : '-'
-                                    echo "      task#${idx+1} ${t.task_key} → TARGET=${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(ALL)'}  deps=[${deps}]"
+                                    def tgt  = t.notebook_task?.base_parameters?.TARGET_LOAD_TABLE ?: '(ALL)'
+                                    echo "      task#${idx+1} ${t.task_key} → TARGET=${tgt}  deps=[${deps}]"
                                 }
                             }
                         }
