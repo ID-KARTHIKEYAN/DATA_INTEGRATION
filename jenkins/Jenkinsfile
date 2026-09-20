@@ -267,23 +267,14 @@ pipeline {
                                 def existing   = listJson.jobs?.find { it.settings?.name == jobName }
 
                                 if (existing) {
-                                    def curTasks = existing.settings?.tasks?.size() ?: 1
-                                    if (curTasks == expTasks) {
-                                        wsLocal.job_id = existing.job_id
-                                        echo "  ${jobName} ✅ exists | tasks=${curTasks}"
-                                    } else {
-                                        // Delete stale job
-                                        def dt = writeJSON(returnText:true, json:[job_id: existing.job_id])
-                                        def df = "/tmp/del_${System.currentTimeMillis()}.json"
-                                        writeFile file: df, text: dt
-                                        sh "curl -s -X POST '${wsLocal.workspace_url}/api/2.1/jobs/delete' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${df}"
-                                        sh "rm -f ${df}"
-                                        echo "  ${jobName} outdated (${curTasks}→${expTasks} tasks) — deleted"
-                                        existing = null
-                                    }
+                                    // Job exists — UPDATE in place via jobs/reset (preserves run history, no delete)
+                                    wsLocal.job_id = existing.job_id
+                                    def curTasks   = existing.settings?.tasks?.size() ?: 1
+                                    echo "  ${jobName} exists | job_id=${wsLocal.job_id} | tasks: ${curTasks} -> ${expTasks}"
                                 }
 
-                                if (!existing) {
+                                // Always build tasks then RESET (update) or CREATE depending on whether job exists
+                                if (true) {
                                     // Build tasks list with PRIORITY-based dependencies
                                     def tasks = []
                                     if (tableRows.isEmpty()) {
@@ -331,14 +322,36 @@ pipeline {
                                         tasks:tasks
                                     ])
                                     def jf  = "/tmp/job_${System.currentTimeMillis()}.json"
-                                    writeFile file:jf, text:jp
-                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${jf}").trim()
-                                    sh "rm -f ${jf}"
-                                    def lines = raw.split('\n')
-                                    if (lines[-1] != '200') error "Job create failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
-                                    def cjson = readJSON text: lines[0..-2].join('\n')
-                                    wsLocal.job_id = cjson.job_id
-                                    echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
+
+                                    if (existing) {
+                                        // UPDATE existing job — jobs/reset replaces full settings, keeps history
+                                        def resetPayload = writeJSON(returnText:true, json:[
+                                            job_id: wsLocal.job_id,
+                                            new_settings: [
+                                                name: jobName,
+                                                description: "GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
+                                                max_concurrent_runs: 1,
+                                                parameters: [[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
+                                                tasks: tasks
+                                            ]
+                                        ])
+                                        writeFile file:jf, text:resetPayload
+                                        def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/reset' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${jf}").trim()
+                                        sh "rm -f ${jf}"
+                                        def lines = raw.split('\n')
+                                        if (lines[-1] != '200') error "Job reset failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
+                                        echo "  ${jobName} updated via reset | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
+                                    } else {
+                                        // CREATE new job
+                                        writeFile file:jf, text:jp
+                                        def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/create' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${jf}").trim()
+                                        sh "rm -f ${jf}"
+                                        def lines = raw.split('\n')
+                                        if (lines[-1] != '200') error "Job create failed HTTP ${lines[-1]}: ${lines[0..-2].join('\n')}"
+                                        def cjson = readJSON text: lines[0..-2].join('\n')
+                                        wsLocal.job_id = cjson.job_id
+                                        echo "  ${jobName} created | job_id=${wsLocal.job_id} | tasks=${tasks.size()}"
+                                    }
                                     tasks.each { t -> 
                                         def deps = t.depends_on ? "[deps: ${t.depends_on.collect{it.task_key}.join(',')}]" : "[no deps]"
                                         echo "    task: ${t.task_key} → ${t.notebook_task.base_parameters.TARGET_LOAD_TABLE ?: '(all)'} ${deps}" 
@@ -476,7 +489,23 @@ pipeline {
 
                                 if (existV) {
                                     vJobId = existV.job_id
-                                    echo "  View job exists: ${vJobId}"
+                                    // UPDATE existing view job via jobs/reset (preserves run history)
+                                    def vp  = writeJSON(returnText:true, json:[
+                                        job_id: vJobId,
+                                        new_settings: [
+                                            name: vJob,
+                                            max_concurrent_runs: 1,
+                                            parameters: [[name:'GROUP_ID',default:groupId],[name:'RUN_LAYER',default:vLayer]],
+                                            tasks: [[task_key:"${vJob}_task", notebook_task:[notebook_path:vPath, base_parameters:[GROUP_ID:groupId, RUN_LAYER:vLayer], source:'WORKSPACE']]]
+                                        ]
+                                    ])
+                                    def vf  = "/tmp/vjob_${System.currentTimeMillis()}.json"
+                                    writeFile file:vf, text:vp
+                                    def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${wsLocal.workspace_url}/api/2.1/jobs/reset' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${vf}").trim()
+                                    sh "rm -f ${vf}"
+                                    def lines = raw.split('\n')
+                                    if (lines[-1] != '200') error "View job reset failed HTTP ${lines[-1]}"
+                                    echo "  View job updated via reset | job_id=${vJobId}"
                                 } else {
                                     def vp  = writeJSON(returnText:true, json:[
                                         name:vJob, max_concurrent_runs:1,
