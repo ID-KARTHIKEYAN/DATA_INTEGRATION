@@ -219,8 +219,9 @@ pipeline {
                             def whId = wh.warehouses[0].id
 
                             def detail = (layer == 'L1' || layer == 'L2') ? 'data_flow_pb_detail' : 'data_flow_l0_detail'
-                            def sql    = (layer == 'L0') 
-                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA, COALESCE(PRIORITY, 999) AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY PRIORITY, SOURCE_OBJ_NAME"
+                            // FIX #1: data_flow_l0_detail has no PRIORITY column — use constant 1 for L0
+                            def sql    = (layer == 'L0')
+                                ? "SELECT SOURCE_OBJ_NAME, SOURCE_OBJ_SCHEMA, 1 AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' ORDER BY SOURCE_OBJ_NAME"
                                 : "SELECT TARGET_OBJ_NAME, TARGET_OBJ_SCHEMA, COALESCE(PRIORITY, 999) AS PRIORITY FROM ${catalog}.admin.${detail} WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(TARGET_OBJ_TYPE)!='VIEW' ORDER BY PRIORITY, TARGET_OBJ_NAME"
                             def p      = writeJSON(returnText:true, json:[statement:sql, warehouse_id:whId, wait_timeout:'50s', on_wait_timeout:'CANCEL'])
                             def tmp    = "/tmp/tbl_${System.currentTimeMillis()}.json"
@@ -448,19 +449,26 @@ pipeline {
                                     return j.result?.data_array ?: []
                                 }
 
-                                def l1 = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND ETL_LAYER='L1' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
-                                def l2 = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND ETL_LAYER='L2' AND IS_ACTIVE='Y' AND UPPER(LOAD_TYPE)='VIEW'")
-                                def l1c = l1 ? (l1[0][0] as int) : 0
-                                def l2c = l2 ? (l2[0][0] as int) : 0
-                                def total = l1c + l2c
+                                // FIX #3: data_flow_pb_detail has no ETL_LAYER column.
+                                // Derive layer from DATA_FLOW_GROUP_ID suffix (same logic as Validate stage).
+                                // Query all VIEW rows for this group — layer is already known from env.DETECTED_LAYER.
+                                def detectedLayer = env.DETECTED_LAYER ?: (
+                                    groupId.endsWith('_L0') ? 'L0' :
+                                    groupId.endsWith('_L1') ? 'L1' :
+                                    groupId.endsWith('_L2') ? 'L2' : 'ALL'
+                                )
 
-                                echo "  ${wsLocal.name}: VIEW rows L1=${l1c} L2=${l2c}"
-                                if (total == 0) { echo "  No VIEW rows — skip"; return }
+                                def viewRows = runQ("SELECT COUNT(*),MAX(TARGET_OBJ_SCHEMA) FROM ${catalog}.admin.data_flow_pb_detail WHERE DATA_FLOW_GROUP_ID='${groupId}' AND IS_ACTIVE='Y' AND UPPER(TARGET_OBJ_TYPE)='MV'")
+                                def viewCount = viewRows ? (viewRows[0][0] as int) : 0
 
-                                def vLayer  = (l1c > 0 && l2c == 0) ? 'L1' : (l2c > 0 && l1c == 0) ? 'L2' : 'ALL'
-                                def tSchema = (l1c > 0 ? l1[0][1] : null) ?: (l2c > 0 ? l2[0][1] : null) ?: 'silver'
+                                echo "  ${wsLocal.name}: MV/VIEW rows=${viewCount} layer=${detectedLayer}"
+                                if (viewCount == 0) { echo "  No MV rows — skip"; return }
+
+                                def vLayer  = detectedLayer
+                                def tSchema = viewRows[0][1] ?: 'silver'
                                 def vJob    = "DBX_${groupId}_VIEW_JOB"
-                                def vPath   = "${wsLocal.github_repo_path}/notebooks/view_pipeline"
+                                // FIX #4: view_pipeline notebook does not exist — route to run_framework same as main job
+                                def vPath   = "${wsLocal.github_repo_path}/notebooks/run_framework"
 
                                 def listJ  = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
                                 def existV = listJ.jobs?.find { it.settings?.name == vJob }
@@ -506,7 +514,7 @@ pipeline {
     }
 
     post {
-        always { echo "GROUP_ID:${params.GROUP_ID} | WORKSPACE:${params.WORKSPACE_OVERRIDE} | LAYER:${env.DETECTED_LAYER} | STATUS:${currentBuild.currentResult}" }
+        always { echo "GROUP_ID:${params.GROUP_ID} | LAYER:${env.DETECTED_LAYER} | STATUS:${currentBuild.currentResult}" }
         success { echo "PIPELINE SUCCESS" }
         failure { echo "PIPELINE FAILED"  }
     }
