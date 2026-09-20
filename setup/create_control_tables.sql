@@ -137,3 +137,37 @@ TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true');
 
 -- ── Verify ────────────────────────────────────────────────────────────────
 SHOW TABLES IN demo_catalog.admin;
+
+-- ── etl_pipeline_lookup ───────────────────────────────────────────────────
+-- Live lookup table — one row per (GROUP_ID, LAYER, TARGET_FULL_NAME).
+-- Auto-upserted by kiro_etl_engine after every object completes.
+-- Use this table to answer:
+--   "What pipelines exist?"         → DISTINCT DATA_FLOW_GROUP_ID, ETL_LAYER
+--   "What tables does L1 produce?"  → WHERE ETL_LAYER = 'L1'
+--   "When did dim_employee last run?" → WHERE TARGET_FULL_NAME LIKE '%dim_employee%'
+--   "Which pipelines are failing?"   → WHERE LAST_STATUS = 'FAILED'
+--   "What is the row count lineage?" → ORDER BY TARGET_FULL_NAME
+-- Key: (DATA_FLOW_GROUP_ID, ETL_LAYER, TARGET_FULL_NAME) — MERGE on these 3 cols.
+CREATE TABLE IF NOT EXISTS demo_catalog.admin.etl_pipeline_lookup (
+    DATA_FLOW_GROUP_ID   STRING    COMMENT 'Pipeline group that produced this object',
+    ETL_LAYER            STRING    COMMENT 'L0, L1, or L2',
+    LOB                  STRING    COMMENT 'Line of Business',
+    SOURCE_REFERENCE     STRING    COMMENT 'L0: source URL. L1/L2: source schema name',
+    TARGET_FULL_NAME     STRING    COMMENT 'Fully-qualified target: catalog.schema.table',
+    LOAD_TYPE            STRING    COMMENT 'FULL / APPEND / DELTA / MERGE / SCD',
+    OBJECT_TYPE          STRING    COMMENT 'TABLE or MV',
+    MERGE_KEYS           STRING    COMMENT 'Comma-separated merge/PK columns (blank for FULL loads)',
+    PARTITION_COLS       STRING    COMMENT 'Comma-separated partition or liquid-cluster columns',
+    LAST_STATUS          STRING    COMMENT 'SUCCESS or FAILED from the most recent run',
+    LAST_ROW_COUNT       BIGINT    COMMENT 'Row count in target after the most recent write',
+    LAST_DURATION_SECS   DOUBLE    COMMENT 'Seconds taken by the most recent run',
+    LAST_RUN_TS          TIMESTAMP COMMENT 'Timestamp of the most recent run',
+    RUN_ID               STRING    COMMENT 'Databricks job run_id of the most recent run',
+    ENVIRONMENT          STRING    COMMENT 'dev / qa / prod'
+)
+USING DELTA
+COMMENT 'Live pipeline object registry — auto-maintained by kiro_etl_engine'
+TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true');
+
+-- ── Verify all tables ─────────────────────────────────────────────────────
+SHOW TABLES IN demo_catalog.admin;

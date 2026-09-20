@@ -258,7 +258,7 @@ pipeline {
                         parallelMap[wsLocal.name] = {
                             withCredentials([string(credentialsId: wsLocal.credential_id, variable: 'DB_TOKEN')]) {
                                 def jobName    = "DBX_${groupId}_JOB"
-                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/run_framework"
+                                def nbPath     = "${wsLocal.github_repo_path}/notebooks/kiro_etl_engine"
                                 def tableRows  = tableMap[wsLocal.name] ?: []
                                 def expTasks   = tableRows.isEmpty() ? 1 : tableRows.size()
 
@@ -467,8 +467,8 @@ pipeline {
                                 def vLayer  = detectedLayer
                                 def tSchema = viewRows[0][1] ?: 'silver'
                                 def vJob    = "DBX_${groupId}_VIEW_JOB"
-                                // FIX #4: view_pipeline notebook does not exist — route to run_framework same as main job
-                                def vPath   = "${wsLocal.github_repo_path}/notebooks/run_framework"
+                                // FIX #4: view_pipeline notebook does not exist — route to kiro_etl_engine same as main job
+                                def vPath   = "${wsLocal.github_repo_path}/notebooks/kiro_etl_engine"
 
                                 def listJ  = readJSON text: sh(returnStdout:true, script:"curl -s '${wsLocal.workspace_url}/api/2.1/jobs/list?limit=100' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
                                 def existV = listJ.jobs?.find { it.settings?.name == vJob }

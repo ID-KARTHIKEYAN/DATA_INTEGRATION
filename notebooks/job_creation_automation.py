@@ -30,10 +30,10 @@ TOKEN         = ctx.apiToken().get()
 
 # ── Derive notebook base path from current notebook's path ───────────────
 # Convention: this notebook lives at .../DATA_INTEGRATION/notebooks/job_creation_automation
-# run_framework lives at the same .../notebooks/run_framework
+# kiro_etl_engine lives at the same .../notebooks/kiro_etl_engine
 raw_path      = ctx.notebookPath().get()           # e.g. /Workspace/Repos/user@x.com/DATA_INTEGRATION/notebooks/job_creation_automation
 REPO_BASE     = raw_path.rsplit("/notebooks/", 1)[0]  # → /Workspace/Repos/user@x.com/DATA_INTEGRATION
-NOTEBOOK_PATH = f"{REPO_BASE}/notebooks/run_framework"
+NOTEBOOK_PATH = f"{REPO_BASE}/notebooks/kiro_etl_engine"
 
 print(f"Workspace     : {WORKSPACE_URL}")
 print(f"Repo base     : {REPO_BASE}")
