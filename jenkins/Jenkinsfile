@@ -10,10 +10,10 @@ pipeline {
         string(name: 'GROUP_ID',   defaultValue: '', description: 'e.g. FINANCE_MEDALLION_L0')
         string(name: 'BUNDLE_TAG', defaultValue: '', description: 'Release tag e.g. v1.0.0')
         string(name: 'VERSION',    defaultValue: '1.0', description: 'Pipeline version')
-        booleanParam(name: 'SYNC_GIT',            defaultValue: true,  description: 'Sync GitHub repo')
-        booleanParam(name: 'SYNC_TABLES_TO_GITHUB', defaultValue: true, description: 'Push SQL to META_STORE_SQL_SCRIPTS/')
-        booleanParam(name: 'CREATE_JOBS',          defaultValue: true,  description: 'Create/verify Databricks jobs')
-        booleanParam(name: 'WAIT_FOR_COMPLETION',  defaultValue: true,  description: 'Wait for job completion')
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'prod'], description: 'Target environment — passed to kiro_etl_engine as the ENVIRONMENT widget')
+        booleanParam(name: 'SYNC_GIT',              defaultValue: true,  description: 'Sync GitHub repo')
+        booleanParam(name: 'SYNC_TABLES_TO_GITHUB', defaultValue: true,  description: 'Push SQL to META_STORE_SQL_SCRIPTS/')
+        booleanParam(name: 'CREATE_JOBS',            defaultValue: true,  description: 'Create/verify Databricks jobs')
     }
 
     environment {
@@ -24,8 +24,6 @@ pipeline {
         GITHUB_BRANCH        = 'main'
         GITHUB_CREDENTIAL_ID = 'GITHUB_TOKEN_SECRET'
         SQL_SCRIPTS_FOLDER   = 'META_STORE_SQL_SCRIPTS'
-        POLL_INTERVAL        = '15'
-        MAX_WAIT_SECS        = '1800'
     }
 
     stages {
@@ -41,8 +39,9 @@ pipeline {
                     def tag   = params.BUNDLE_TAG?.trim() ?: 'untagged'
                     env.DETECTED_LAYER = layer
                     env.DEPLOY_TS      = ts
-                    env.BUNDLE_INFO    = "[v${params.VERSION}][${tag}] ${ts} | ${layer} | ${env.GITHUB_BRANCH}"
-                    echo "GROUP_ID=${gid} | LAYER=${layer} | BUNDLE=${tag} | ${ts}"
+                    env.DEPLOY_ENV     = params.ENVIRONMENT?.trim() ?: 'dev'
+                    env.BUNDLE_INFO    = "[v${params.VERSION}][${tag}] ${ts} | ${layer} | ${env.GITHUB_BRANCH} | env=${env.DEPLOY_ENV}"
+                    echo "GROUP_ID=${gid} | LAYER=${layer} | BUNDLE=${tag} | ENV=${env.DEPLOY_ENV} | ${ts}"
                 }
             }
         }
@@ -278,7 +277,7 @@ pipeline {
                                     // Build tasks list with PRIORITY-based dependencies
                                     def tasks = []
                                     if (tableRows.isEmpty()) {
-                                        tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:tag], source:'WORKSPACE']]]
+                                        tasks = [[task_key:"${groupId}_task", notebook_task:[notebook_path:nbPath, base_parameters:[GROUP_ID:groupId, TARGET_LOAD_TABLE:'ALL', ENVIRONMENT:env.DEPLOY_ENV], source:'WORKSPACE']]]
                                     } else {
                                         // Group tables by priority
                                         def priorityGroups = [:]
@@ -297,7 +296,7 @@ pipeline {
                                                     task_key: tbl.replaceAll('[^a-zA-Z0-9_]','_'),
                                                     notebook_task: [
                                                         notebook_path: nbPath,
-                                                        base_parameters: [GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:tag],
+                                                        base_parameters: [GROUP_ID:groupId, TARGET_LOAD_TABLE:tbl, ENVIRONMENT:env.DEPLOY_ENV],
                                                         source: 'WORKSPACE'
                                                     ]
                                                 ]
@@ -316,9 +315,9 @@ pipeline {
                                     }
 
                                     def jp  = writeJSON(returnText:true, json:[
-                                        name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
+                                        name:jobName, description:"GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|Env:${env.DEPLOY_ENV}|${env.DEPLOY_TS}",
                                         max_concurrent_runs:1,
-                                        parameters:[[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
+                                        parameters:[[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:env.DEPLOY_ENV]],
                                         tasks:tasks
                                     ])
                                     def jf  = "/tmp/job_${System.currentTimeMillis()}.json"
@@ -329,9 +328,9 @@ pipeline {
                                             job_id: wsLocal.job_id,
                                             new_settings: [
                                                 name: jobName,
-                                                description: "GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|${env.DEPLOY_TS}",
+                                                description: "GROUP_ID:${groupId}|Layer:${env.DETECTED_LAYER}|Bundle:${tag}|Env:${env.DEPLOY_ENV}|${env.DEPLOY_TS}",
                                                 max_concurrent_runs: 1,
-                                                parameters: [[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:tag]],
+                                                parameters: [[name:'GROUP_ID',default:groupId],[name:'ENVIRONMENT',default:env.DEPLOY_ENV]],
                                                 tasks: tasks
                                             ]
                                         ])
@@ -378,7 +377,7 @@ pipeline {
                     wsList.each { ws ->
                         pMap[ws.name] = {
                             withCredentials([string(credentialsId: ws.credential_id, variable: 'DB_TOKEN')]) {
-                                def tp  = writeJSON(returnText:true, json:[job_id:ws.job_id, job_parameters:[GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER]])
+                                def tp  = writeJSON(returnText:true, json:[job_id:ws.job_id, job_parameters:[GROUP_ID:groupId, RUN_LAYER:env.DETECTED_LAYER, ENVIRONMENT:env.DEPLOY_ENV]])
                                 def tf  = "/tmp/trig_${System.currentTimeMillis()}.json"
                                 writeFile file:tf, text:tp
                                 def raw = sh(returnStdout:true, script:"curl -s -w \"\\n%{http_code}\" -X POST '${ws.workspace_url}/api/2.1/jobs/run-now' -H 'Authorization: Bearer ${DB_TOKEN}' -H 'Content-Type: application/json' -d @${tf}").trim()
@@ -398,41 +397,7 @@ pipeline {
             }
         }
 
-        // ── STAGE 7 : WAIT ──────────────────────────────────
-        stage('Wait For Completion') {
-            when { expression { params.WAIT_FOR_COMPLETION } }
-            steps {
-                script {
-                    def runIds     = readJSON text: env.RUN_IDS
-                    def allPassed  = true
-                    def failedList = []
-
-                    runIds.each { wsName, info ->
-                        withCredentials([string(credentialsId: info.credential_id, variable: 'DB_TOKEN')]) {
-                            def elapsed = 0
-                            def done    = false
-                            def lc = ''; def rs = ''
-                            while (!done && elapsed < Integer.parseInt(env.MAX_WAIT_SECS)) {
-                                sleep(Integer.parseInt(env.POLL_INTERVAL))
-                                elapsed += Integer.parseInt(env.POLL_INTERVAL)
-                                def p    = readJSON text: sh(returnStdout:true, script:"curl -s '${info.workspace_url}/api/2.1/jobs/runs/get?run_id=${info.run_id}' -H 'Authorization: Bearer ${DB_TOKEN}'").trim()
-                                lc       = p.state?.life_cycle_state ?: 'UNKNOWN'
-                                rs       = p.state?.result_state     ?: ''
-                                echo "${wsName} | ${lc} | ${rs}"
-                                if (['TERMINATED','SKIPPED','INTERNAL_ERROR'].contains(lc)) done = true
-                            }
-                            if (!done)        { failedList << "${wsName}(TIMEOUT)"; allPassed = false }
-                            else if (rs != 'SUCCESS') { failedList << "${wsName}(${rs})"; allPassed = false }
-                            else echo "${wsName} — SUCCESS"
-                        }
-                    }
-                    if (!allPassed) error "Failed: ${failedList.join(', ')}"
-                    echo "All workspaces complete"
-                }
-            }
-        }
-
-        // ── STAGE 8 : TRIGGER VIEW PIPELINE ─────────────────
+        // ── STAGE 7 : TRIGGER VIEW PIPELINE ─────────────────
         stage('Trigger View Pipeline') {
             when { expression { currentBuild.currentResult == 'SUCCESS' } }
             steps {
