@@ -28,12 +28,31 @@ ctx           = dbutils.notebook.entry_point.getDbutils().notebook().getContext(
 WORKSPACE_URL = "https://" + ctx.browserHostName().get()
 TOKEN         = ctx.apiToken().get()
 
-# ── Derive notebook base path from current notebook's path ───────────────
-# Convention: this notebook lives at .../DATA_INTEGRATION/notebooks/job_creation_automation
-# kiro_etl_engine lives at the same .../notebooks/kiro_etl_engine
-raw_path      = ctx.notebookPath().get()           # e.g. /Workspace/Repos/user@x.com/DATA_INTEGRATION/notebooks/job_creation_automation
-REPO_BASE     = raw_path.rsplit("/notebooks/", 1)[0]  # → /Workspace/Repos/user@x.com/DATA_INTEGRATION
-NOTEBOOK_PATH = f"{REPO_BASE}/notebooks/kiro_etl_engine"
+# ── Derive notebook path — lookup table takes priority over context path ──
+# Step 1: Try to read engine_notebook_path from data_flow_env_config_lookup
+# Step 2: Fallback — derive from this notebook's own context path
+NOTEBOOK_PATH = ""
+try:
+    lkp_rows = spark.sql(f"""
+        SELECT CONTEXT_VALUE
+        FROM   demo_catalog.admin.data_flow_env_config_lookup
+        WHERE  UPPER(ENVIRONMENT) = 'DEV'
+          AND  CONTEXT_KEY        = 'engine_notebook_path'
+          AND  IS_VALID           = 'Y'
+        LIMIT 1
+    """).collect()
+    if lkp_rows and (lkp_rows[0]["CONTEXT_VALUE"] or "").strip():
+        NOTEBOOK_PATH = lkp_rows[0]["CONTEXT_VALUE"].strip()
+        print(f"Notebook path  : {NOTEBOOK_PATH}  (from env config lookup)")
+except Exception as _lkp_err:
+    print(f"  WARN: Could not read engine_notebook_path from lookup: {_lkp_err}")
+
+if not NOTEBOOK_PATH:
+    # Fallback: derive from this notebook's own workspace path
+    raw_path      = ctx.notebookPath().get()
+    REPO_BASE     = raw_path.rsplit("/notebooks/", 1)[0]
+    NOTEBOOK_PATH = f"{REPO_BASE}/notebooks/kiro_etl_engine"
+    print(f"Notebook path  : {NOTEBOOK_PATH}  (derived from context — fallback)")
 
 print(f"Workspace     : {WORKSPACE_URL}")
 print(f"Repo base     : {REPO_BASE}")
